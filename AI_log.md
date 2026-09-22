@@ -269,3 +269,141 @@ Nothing committed this session by the agent beyond that log.
 - Model: deepseek-v4-flash (provider: deepseek)
 - Tokens: 1,164 in · 848 out · 347,264 cache-read · 348 reasoning · 3 API calls
 - Basis: delta since baseline (2026-09-22T14:41:15+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 16:42 SAST
+
+## Interaction 14 — 2026-09-22 20:10 SAST
+
+### Prompt
+Quick checkin. Did some work now. Hash sort and compare
+
+### Response
+Assessed the hash-sort-compare approach as a good fit for the rough cross-check and better than
+jsondiff here, since sorting removes the record-order problem that S3 SELECT leaves open. Flagged
+the three ways it bites: hashing raw JSON text fails on the float serialisation difference
+(S3 SELECT writes scientific notation, the reference file decimal), so the hash must be over a
+canonical form of the parsed shared fields with sorted keys and no whitespace; the hash must be
+computed over the shared fields only, because including `resolution` guarantees a 100% mismatch
+against the reference file; and the hash-to-index mapping has to be retained or a mismatch says
+only that something differs, not which record. Gave the canonicalisation shape
+(`json.dumps(props_subset, sort_keys=True, separators=(",", ":"))` hashed with sha256).
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 1,495 in · 1,707 out · 351,872 cache-read · 1,086 reasoning · 3 API calls
+- Basis: delta since baseline (2026-09-22T14:42:21+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:10 SAST
+
+## Interaction 15 — 2026-09-22 20:14 SAST
+
+### Prompt
+Where shoul canon be sued?
+
+### Response
+Answered that canonicalisation belongs at the single point where a record becomes a hash, called
+by both sides of the comparison — the S3 SELECT records and the features read from the reference
+file — so the two cannot drift apart. It must not be used when writing the output artefact, which
+should carry full records rather than hashes; the hash is a comparison instrument, not a
+serialisation format. Sequence given: parse, canonicalise the shared properties subset, hash,
+collect a hash-to-index map, then compare sort or set equality.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 1,808 in · 1,293 out · 359,296 cache-read · 400 reasoning · 3 API calls
+- Basis: delta since baseline (2026-09-22T18:10:41+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:14 SAST
+
+## Interaction 16 — 2026-09-22 20:18 SAST
+
+### Prompt
+Just throw it in where it should be. Did ext already
+
+### Response
+Read `1_S3_Data_Extract.py` (120 lines) and found `canon` uncalled and `hashlib` unimported, so it
+would have raised `NameError` on first use. Made two edits on express instruction: added
+`import hashlib`, and rewired `cheapValidation` to hash-sort-compare via `canon` in place of the
+`deepdiff.DeepDiff(..., ignore_order=True) == {}` call, leaving `deepValidation`'s per-record
+deepdiff scoring untouched. Verified offline by extracting only the two function definitions and
+running them under json/hashlib with synthetic records: identical and reordered lists pass;
+changed value, missing record and duplicate record all fail; the scientific-notation and decimal
+spellings of the same float hash equal. Did not run the script end to end, since that spends two
+108 MB scans and rewrites the artefacts.
+
+Also raised: `cheap_validation_results.json` is two JSON documents concatenated by successive
+`json.dump` calls, so no parser can read it back as one document; there is still no
+`requirements.txt`, and `deepdiff` is now a dependency; an all-zero-record run reports
+"equivalent" (confirmed: empty versus empty returns True), which is a latent false pass; and
+`S3Select` is constructed twice, making four credential fetches per run.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 51,208 in · 7,552 out · 739,712 cache-read · 5,703 reasoning · 8 API calls
+- Aux calls (compression): 18,789 in · 12,828 out · 1 API call
+- Basis: delta since baseline (2026-09-22T18:14:03+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:18 SAST
+
+## Interaction 17 — 2026-09-22 20:24 SAST
+
+### Prompt
+Is your change there? Don't see it
+
+### Response
+Confirmed the edits are on disk and the file has not been clobbered: mtime 2026-09-22 20:17:19, size
+4,485 bytes (up from 4,396, matching the two edits), `import hashlib` at line 3, and the hash
+comparison body at lines 99-101. Concluded he is looking at a stale editor buffer and needs to
+reload the file.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 3,043 in · 1,894 out · 239,616 cache-read · 540 reasoning · 4 API calls
+- Basis: delta since baseline (2026-09-22T18:18:17+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:24 SAST
+
+## Interaction 18 — 2026-09-22 20:26 SAST
+
+### Prompt
+How are we looking for far and what are the outstanding items? I know the stats is one.
+
+### Response
+Re-read the submission and challenge sections of the README (lines 60-190) and reviewed the repo
+state against them. Flagged first that the Data Engineering role covers three sections, not one:
+1 (Data Extraction, line 103), 2 (Initial Data Transformation, line 110) and 5 (Further Data
+Transformations, line 161, itself three sub-tasks), against three days to the Friday deadline.
+Section 1 status: the S3 SELECT extraction and the reference-file cross-check are done; the schema
+conformance score and its standalone schema file (line 106) are not started; the timing and stats
+logging (line 108) are not started; no extraction artefact is written to disk, so nothing
+materialises the resolution-8 dataset that section 2 joins against; `cheap_validation_results.json`
+is still two concatenated JSON documents; an all-zero-record run still reports "equivalent"; and
+there is still no `requirements.txt`, no `.gitignore`, no `__main__` guard, and dead code
+(`printRecords`, the `operator` import) plus non-standard indentation in `jsonConv`.
+
+Also noted the commit history as a deliverable in its own right (line 63): one commit tonight,
+`8ee98ad`, with the current validated work uncommitted. Recommended committing the working state
+in coherent chunks before starting the next section, and gave the measured optimisation figures
+for the write-up: naive `get_object` plus `json.loads` costs 11.48 s and 689 MB peak, against
+approximately 2.5 s and 108.25 MB scanned with about 508 KB returned via S3 SELECT.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 6,225 in · 5,783 out · 394,624 cache-read · 4,787 reasoning · 6 API calls
+- Aux calls (approval): 374 in · 105 out · 1 API call
+- Basis: delta since baseline (2026-09-22T18:24:21+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:26 SAST
+
+## Interaction 19 — 2026-09-22 20:28 SAST
+
+### Prompt
+I am refering to just Section 1.
+
+### Response
+Narrowed the status review to section 1 only and dropped the sections 2 and 5 scope warning.
+Restated the section 1 checklist: line 104 extraction and reference-file validation both done;
+line 106 schema conformance score, non-binary threshold and standalone schema file all outstanding;
+line 108 timing and stats logging outstanding; plus the outstanding items found in the code — no
+extraction artefact written to disk, `cheap_validation_results.json` unreadable as one JSON
+document, the all-zero-record false pass, and the hygiene list (requirements file, ignore rules,
+entry-point guard, dead code, indentation, docstrings).
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 2,013 in · 1,367 out · 419,072 cache-read · 648 reasoning · 3 API calls
+- Basis: delta since baseline (2026-09-22T18:26:43+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:28 SAST

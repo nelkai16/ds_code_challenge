@@ -1,9 +1,9 @@
-from urllib import response
-
+import deepdiff
 import boto3
+import hashlib
 import json
-import jsondiff
 import requests
+import operator
 
 bucket_name = 'cct-ds-code-challenge-input-data'
 keys = 'ds_code_challenge_creds.json'
@@ -72,7 +72,33 @@ class jsonConv:
               buf += event['Records']['Payload']     # accumulate across every event
       lines = [l for l in buf.decode('utf-8').split('\n') if l.strip()]
       records = [json.loads(l) for l in lines]
-      return records                
+      return records   
+  
+def canon(props):
+    shared = {k: props[k] for k in ("index", "centroid_lat", "centroid_lon")}
+    blob = json.dumps(shared, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()     
+
+def deepValidation(json1, json2):
+    newSchema = []
+    
+    sorted_json1 = sorted(json1, key=lambda x: x['index'])
+    sorted_json2 = sorted(json2, key=lambda x: x['index'])
+
+    for obj1, obj2 in zip(sorted_json1, sorted_json2):
+        obj = {
+            'index1': obj1['index'],
+            'index2': obj2['index'],
+            'sim': (1 - (deepdiff.DeepDiff(obj1, obj2, get_deep_distance=True)).get('deep_distance', 0))*100
+        }
+        newSchema.append(obj)
+    with open('validation_results.json', 'w') as f:
+        json.dump(newSchema, f, indent=4)
+
+def cheapValidation(json1, json2):
+    hashes1 = sorted(canon(record) for record in json1)
+    hashes2 = sorted(canon(record) for record in json2)
+    return hashes1 == hashes2
 
 resQuery = "SELECT s.properties.index, s.properties.centroid_lat, s.properties.centroid_lon FROM S3Object[*].features[*] s where s.properties.resolution = 8"
 resFile = 'city-hex-polygons-8-10.geojson'
@@ -84,11 +110,14 @@ validationProps = S3Select(url, region, keys).select_data(bucket_name, validatio
 queriedJson = jsonConv(queriedProps).convert_to_json()
 validationJson = jsonConv(validationProps).convert_to_json()
 
-delta = jsondiff.diff(validationJson, queriedJson, syntax='symmetric', dump=True)
-print(json.dumps(delta, indent=2))
-
-#Looking at this wrong. Files = seperate from additional validation. Validation schema is new file composed of score
-#   from validation. Reading the validation here as two parts. 1st validation, using the 8 file. This is plainly stated so
-#   will maintain the json diff as a "rough" validation on a raw compare. Second validation, interpreting as that due to
-#   wording of additional. Going to include the geo data now so that there is more "source" to validate. Will output this  
-#   to a new .json file composed of the index as the key, and validation score
+if cheapValidation(queriedJson, validationJson):
+    with open('cheap_validation_results.json', 'w') as f:
+        json.dump("The two JSON objects are equivalent.", f)
+        json.dump(queriedJson, f)
+else:
+    with open('cheap_validation_results.json', 'w') as f:
+        json.dump("The two JSON objects are not equivalent.\n", f)
+        json.dump(queriedJson, f)
+        json.dump(validationJson, f)
+                
+deepValidation(queriedJson, validationJson)
