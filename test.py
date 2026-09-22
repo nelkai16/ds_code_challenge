@@ -21,9 +21,9 @@ s3 = boto3.client(
 
 resp = s3.select_object_content(
     Bucket='cct-ds-code-challenge-input-data',
-    Key='city-hex-polygons-8.geojson',
+    Key='city-hex-polygons-8-10.geojson',
     ExpressionType='SQL',
-    Expression="SELECT s.properties, s.geometry FROM S3Object[*].features[*] s",
+    Expression="SELECT s.properties, s.geometry FROM S3Object[*].features[*] s where s.properties.resolution = 8",
     InputSerialization={
         'JSON': {'Type': 'DOCUMENT'},
         'CompressionType': 'NONE' 
@@ -33,5 +33,7 @@ resp = s3.select_object_content(
     }
 )
 
-print(s3.get_object(Bucket="cct-ds-code-challenge-input-data", Key='city-hex-polygons-8-10.geojson',
-                   Range='bytes=0-2000')['Body'].read())
+for event in resp['Payload']:
+  if 'Records' in event:
+    records = event['Records']['Payload'].decode('utf-8')
+    print(records, end='')
