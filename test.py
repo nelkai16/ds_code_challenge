@@ -1,10 +1,21 @@
 import boto3
 import json
+import requests
+
+url = "https://cct-ds-code-challenge-input-data.s3.af-south-1.amazonaws.com/ds_code_challenge_creds.json"
+response = requests.get(url)
+
+if response.status_code == 200:
+    data = response.json()
+    access_key = (data['s3']['access_key'])
+    secret_key =(data['s3']['secret_key'])
+else:
+    print(f"Request failed with status code {response.status_code}")
 
 s3 = boto3.client(
     's3',
-    aws_access_key_id='',
-    aws_secret_access_key='',
+    aws_access_key_id=access_key,
+    aws_secret_access_key=secret_key,
     region_name='af-south-1'
 )
 
