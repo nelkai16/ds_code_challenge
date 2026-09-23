@@ -1,3 +1,5 @@
+import string
+
 import deepdiff
 import boto3
 import hashlib
@@ -5,119 +7,190 @@ import json
 import requests
 import operator
 
-bucket_name = 'cct-ds-code-challenge-input-data'
-keys = 'ds_code_challenge_creds.json'
+bucket_name = "cct-ds-code-challenge-input-data"
+keys = "ds_code_challenge_creds.json"
 url = "https://cct-ds-code-challenge-input-data.s3.af-south-1.amazonaws.com/"
-region = 'af-south-1'
+region = "af-south-1"
 
-class grabKeys: 
+
+class grabKeys:
     def __init__(self):
         pass
+
     def get_keys(self, url, keyFile):
         self.url = url
         self.keyFile = keyFile
-        
-        response = requests.get((self.url+self.keyFile))
+
+        response = requests.get((self.url + self.keyFile))
         if response.status_code == 200:
             data = response.json()
-            access_key = data['s3']['access_key']
-            secret_key = data['s3']['secret_key']
+            access_key = data["s3"]["access_key"]
+            secret_key = data["s3"]["secret_key"]
             return access_key, secret_key
         else:
             print(f"Request failed with status code {response.status_code}")
             return None, None
-        
+
+
 class S3Select:
     def __init__(self, url, region, keyFile):
         self.s3 = boto3.client(
-            's3',
+            "s3",
             aws_access_key_id=grabKeys().get_keys(url, keyFile)[0],
             aws_secret_access_key=grabKeys().get_keys(url, keyFile)[1],
-            region_name=region
+            region_name=region,
         )
 
     def select_data(self, bucket, key, expression):
         resp = self.s3.select_object_content(
             Bucket=bucket,
             Key=key,
-            ExpressionType='SQL',
+            ExpressionType="SQL",
             Expression=expression,
             InputSerialization={
-                'JSON': {'Type': 'DOCUMENT'},
-                'CompressionType': 'NONE' 
+                "JSON": {"Type": "DOCUMENT"},
+                "CompressionType": "NONE",
             },
-            OutputSerialization={
-                'JSON': {'RecordDelimiter': '\n'}
-            }
+            OutputSerialization={"JSON": {"RecordDelimiter": "\n"}},
         )
         return resp
+
 
 class printRecords:
     def __init__(self, response):
         self.response = response
 
     def print_data(self):
-        for event in self.response['Payload']:
-            if 'Records' in event:
-                records = event['Records']['Payload'].decode('utf-8')
-                print(records, end='')
+        for event in self.response["Payload"]:
+            if "Records" in event:
+                records = event["Records"]["Payload"].decode("utf-8")
+                print(records, end="")
+
+
 class jsonConv:
     def __init__(self, response):
         self.response = response
 
     def convert_to_json(self):
-      buf = bytearray()
-      for event in self.response['Payload']:
-          if 'Records' in event:
-              buf += event['Records']['Payload']     # accumulate across every event
-      lines = [l for l in buf.decode('utf-8').split('\n') if l.strip()]
-      records = [json.loads(l) for l in lines]
-      return records   
-  
+        buf = bytearray()
+        for event in self.response["Payload"]:
+            if "Records" in event:
+                buf += event["Records"]["Payload"]  # accumulate across every event
+        lines = [l for l in buf.decode("utf-8").split("\n") if l.strip()]
+        records = [json.loads(l) for l in lines]
+        return records
+
+
 def canon(props):
     shared = {k: props[k] for k in ("index", "centroid_lat", "centroid_lon")}
     blob = json.dumps(shared, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode()).hexdigest()     
+    return hashlib.sha256(blob.encode()).hexdigest()
+
 
 def deepValidation(json1, json2):
     newSchema = []
-    
-    sorted_json1 = sorted(json1, key=lambda x: x['index'])
-    sorted_json2 = sorted(json2, key=lambda x: x['index'])
+
+    sorted_json1 = sorted(json1, key=lambda x: x["index"])
+    sorted_json2 = sorted(json2, key=lambda x: x["index"])
 
     for obj1, obj2 in zip(sorted_json1, sorted_json2):
         obj = {
-            'index1': obj1['index'],
-            'index2': obj2['index'],
-            'sim': (1 - (deepdiff.DeepDiff(obj1, obj2, get_deep_distance=True)).get('deep_distance', 0))*100
+            "index1": obj1["index"],
+            "index2": obj2["index"],
+            "sim": (
+                1
+                - (deepdiff.DeepDiff(obj1, obj2, get_deep_distance=True)).get(
+                    "deep_distance", 0
+                )
+            )
+            * 100,
         }
         newSchema.append(obj)
-    with open('validation_results.json', 'w') as f:
+    with open("validation_results.json", "w") as f:
         json.dump(newSchema, f, indent=4)
+
 
 def cheapValidation(json1, json2):
     hashes1 = sorted(canon(record) for record in json1)
     hashes2 = sorted(canon(record) for record in json2)
     return hashes1 == hashes2
 
-resQuery = "SELECT s.properties.index, s.properties.centroid_lat, s.properties.centroid_lon FROM S3Object[*].features[*] s where s.properties.resolution = 8"
-resFile = 'city-hex-polygons-8-10.geojson'
+def evaluate_gates(records):
+    count_positive = len(records) > 0
+    index_unique = len({r.get("index") for r in records}) == len(records)
+    
+    if count_positive and index_unique:
+        return True
+    else:
+        print("Validation failed: Either no records found or duplicate indices present.")
+        return False
+        
+def record_checks(record):
+    reason = ""
+    keys_exact = {"index", "centroid_lat", "centroid_lon"}.issubset(record.keys())
+    idx_str = record.get("index", "")
+    index_format = (
+        isinstance(idx_str, str) and
+        len(idx_str) == 15 and 
+        idx_str.startswith('8') and 
+        all(c in string.hexdigits.lower() for c in idx_str)
+    )
+    resolution_is_8 = False
+    if index_format and record.get("resolution") == 8:
+        idx_int = int(idx_str, 16)
+        extracted_res = (idx_int >> 52) & 0xF
+        resolution_is_8 = (extracted_res == 8)
+        
+    if keys_exact and index_format and resolution_is_8:
+        return True
+    else:
+        switch = {
+            not keys_exact: "Missing required keys.",
+            not index_format: "Index format is incorrect.",
+            not resolution_is_8: "Resolution extracted from index is not 8.",
+        }
+        for condition, message in switch.items():
+            if condition:
+                reason = message
+                break
+        print(f"Record {record.get('index', 'Unknown')} NOT OK. Reason = {reason}")
+        return False
+
+resQuery = "SELECT s.properties.* FROM S3Object[*].features[*] s where s.properties.resolution = 8"
+resFile = "city-hex-polygons-8-10.geojson"
 validationQuery = "SELECT s.properties.index, s.properties.centroid_lat, s.properties.centroid_lon FROM S3Object[*].features[*] s"
-validationFile = 'city-hex-polygons-8.geojson'
+validationFile = "city-hex-polygons-8.geojson"
+SCHEMA = 'schema.yml'
+failure={}
 
 queriedProps = S3Select(url, region, keys).select_data(bucket_name, resFile, resQuery)
-validationProps = S3Select(url, region, keys).select_data(bucket_name, validationFile, validationQuery)
+validationProps = S3Select(url, region, keys).select_data(
+    bucket_name, validationFile, validationQuery
+)
 queriedJson = jsonConv(queriedProps).convert_to_json()
 validationJson = jsonConv(validationProps).convert_to_json()
 
-if cheapValidation(queriedJson, validationJson):
-    with open('cheap_validation_results.json', 'w') as f:
-        json.dump("The two JSON objects are equivalent.", f)
-        json.dump(queriedJson, f)
+isvalid = evaluate_gates(queriedJson)
+if isvalid:
+    for r in queriedJson:
+        idx = r.get("index","Unknown")
+
+        if record_checks(r):
+                print(f"Record {idx} OK. Reason = {r}")
+        else:
+             print(f"Record {idx} NOT OK. Reason = {r}")
+             failure.setdefault(idx, []).append({"validation_error": r})
 else:
-    with open('cheap_validation_results.json', 'w') as f:
-        json.dump("The two JSON objects are not equivalent.\n", f)
-        json.dump(queriedJson, f)
-        json.dump(validationJson, f)
-                
-deepValidation(queriedJson, validationJson)
+    print("Validation failed: Either no records found or duplicate indices present.")
+
+# if cheapValidation(queriedJson, validationJson):
+#     with open("cheap_validation_results.json", "w") as f:
+#         json.dump("The two JSON objects are equivalent.", f)
+#         json.dump(queriedJson, f)
+# else:
+#     with open("cheap_validation_results.json", "w") as f:
+#         json.dump("The two JSON objects are not equivalent.\n", f)
+#         json.dump(queriedJson, f)
+#         json.dump(validationJson, f)
+
+# deepValidation(queriedJson, validationJson)

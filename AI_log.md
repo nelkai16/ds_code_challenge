@@ -407,3 +407,166 @@ entry-point guard, dead code, indentation, docstrings).
 - Model: deepseek-v4-flash (provider: deepseek)
 - Tokens: 2,013 in · 1,367 out · 419,072 cache-read · 648 reasoning · 3 API calls
 - Basis: delta since baseline (2026-09-22T18:26:43+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:28 SAST
+
+## Interaction 20 — 2026-09-22 20:29 SAST
+
+### Prompt
+Is the schema score not covered already?
+
+### Response
+Answered no, and gave the discriminating test: if the provided reference file were deleted, could the
+score still be computed? `validation_results.json` is a similarity-to-reference metric, so it fails
+that test. It measures how close the extract is to the provided file, which is line 104's job, not
+line 106's conformance-to-declared-requirements job. Also noted that both sides of the comparison
+come from the same projection, so the metric can only ever measure value agreement, never shape
+conformance, and that it encodes no requirements, carries no aggregate, and has no threshold.
+Suggested the useful reuse: keep the output shape (score per index) and change the yardstick, adding
+the declared requirements, the threshold and the aggregate score. Distinguished the schema file
+(input, declares requirements) from the score file (output, records the result).
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 2,897 in · 3,727 out · 377,856 cache-read · 1,460 reasoning · 5 API calls
+- Basis: delta since baseline (2026-09-22T18:26:53+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:29 SAST
+
+## Interaction 21 — 2026-09-22 20:32 SAST
+
+### Prompt
+Deleted the two json files. Going to rerun now.
+
+### Response
+No assistance given. Noted the expected results of the run so he could verify from the artefacts,
+and that the script prints nothing to stdout, so the files are the only evidence of success.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 2,153 in · 884 out · 388,608 cache-read · 335 reasoning · 3 API calls
+- Basis: delta since baseline (2026-09-22T18:29:24+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:32 SAST
+
+## Interaction 22 — 2026-09-22 20:31 SAST
+
+### Prompt
+Done
+
+### Response
+Verified the two artefacts he regenerated, read-only. `validation_results.json` holds 3,832 entries
+with sim min, max and mean all 100.000000, zero non-perfect entries, 3,832 distinct indices on each
+side and every index pair aligned, so the sort-and-zip pairing is correct and the sets are identical.
+The hash compare reports "The two JSON objects are equivalent." and the second document holds 3,832
+records, first record index `88ad361801fffff`. Confirmed by test that
+`cheap_validation_results.json` is not parseable as one JSON document ("Extra data at char 38").
+Also observed that the round trip through `json.loads` and `json.dump` re-serialised the floats into
+plain decimal, so the artefact no longer carries the S3 SELECT scientific-notation spelling.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 3,032 in · 3,279 out · 566,656 cache-read · 1,349 reasoning · 7 API calls
+- Basis: delta since baseline (2026-09-22T18:29:48+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:31 SAST
+
+## Interaction 23 — 2026-09-22 20:38 SAST
+
+### Prompt
+Open items now?
+
+### Response
+Re-checked the repo and listed the section 1 open items in impact order: the conformance score and
+its standalone schema file (line 106, not started); timing and stats logging (line 108, not
+started); the missing resolution-8 extraction artefact; `cheap_validation_results.json` still not
+parseable as one JSON document (re-confirmed: "Extra data at char 38"); the all-zero-record false
+pass; hygiene (requirements file, ignore rules, entry-point guard, dead code, `jsonConv`
+indentation, docstrings); logging in place of print; and the two uncommitted files. Also raised the
+new question of whether the generated artefacts should stay tracked, since `8884736` committed both
+and any rerun now produces a diff in a 381 KB file.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 2,031 in · 1,444 out · 616,064 cache-read · 1,078 reasoning · 5 API calls
+- Basis: delta since baseline (2026-09-22T18:31:46+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:38 SAST
+
+## Interaction 24 — 2026-09-22 20:40 SAST
+
+### Prompt
+Note those. We will return to each item at a time tomorrow.
+
+### Response
+Wrote the open items to `/home/kai/.hermes/docs/plans/cct-section-1-open-items.md` (outside the repo,
+beside the section 1 plan), structured for item-at-a-time resumption: current verified state, the
+nine open items with what each requires, the decisions already settled, and the measured figures for
+the line 108 optimisation claim.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 2,500 in · 2,522 out · 656,128 cache-read · 1,591 reasoning · 5 API calls
+- Basis: delta since baseline (2026-09-22T18:38:04+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-22 20:40 SAST
+
+## Interaction 25 — 2026-09-23 07:58 SAST
+
+### Prompt
+So far we do have a schema export in deepvalidation. This creates a json schema with index1,index2 and the score of distance between the two hashes items related to the indexes. Will now build a comparision score, counts rows and builds the avg score and outputs results and if it meets the threshhold. Fine?
+
+### Response
+Answered partly, not fine as the line 106 answer. Corrected the terminology: the deepvalidation output is a
+comparison results report, not a schema — it records distances between two extracts and declares no
+requirements, so the standalone schema file is still missing and the delete-the-reference test still
+fails. Also noted the metric is degenerate on this dataset: every pair scores 100.0 when the extract
+matches, so a threshold on the average cannot bite, and the README asks for a threshold that
+discriminates. Flagged a trap in averaging over zipped pairs: if a record is missing or extra the zip
+truncates and the average still reads 100, so the record count has to be a hard gate rather than a
+reported figure. Recommended keeping the aggregate as the line 104 cross-check summary, labelled as
+such, with the schema-weighted score as the separate line 106 answer.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 4,934 in · 11,010 out · 974,592 cache-read · 6,400 reasoning · 11 API calls
+- Aux calls (approval): 396 in · 61 out · 1 API call
+- Basis: delta since baseline (2026-09-22T18:31:40+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 07:58 SAST
+
+## Interaction 26 — 2026-09-23 07:59 SAST
+
+### Prompt
+So the "report" must be retooled to the schema as now it is now relevant. I am comparing on just props, not the geometrics. Give me a worded guide
+
+### Response
+Gave a worded retooling guide for turning the per-record comparison report into the schema conformance
+report, props only: keep the file-per-run output, the sorted-by-index determinism and the summary block;
+drop `index2`, the deepdiff distance and the pairing, which belong to the line 104 cross-check and carry
+the truncation trap; add schema loading with the path recorded in the output, a check registry keyed by
+the schema's check ids returning a reason string on failure, per-record evaluation, per-check tallies,
+the weighted score with load-time validation that the weights sum to one, dataset gates that fail the run
+rather than denting the score, and the threshold comparison written beside the score. Specified the output
+contents, the run order (extract, parse, gates, per-record checks, tallies, score, threshold, write), the
+props-only boundary including the resolution check derived from the index bits, fixed rounding for
+comparability, and a non-zero exit on failure.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 5,860 in · 3,746 out · 1,013,760 cache-read · 2,728 reasoning · 7 API calls
+- Aux calls (approval): 396 in · 61 out · 1 API call
+- Basis: delta since baseline (2026-09-22T18:31:40+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 07:59 SAST
+
+## Interaction 27 — 2026-09-23 08:02 SAST
+
+### Prompt
+Bullet poitns in pseudocode
+
+### Response
+Restated the same retooling guide as pseudocode bullets: schema loading with the weights-sum-to-one
+assertion and the schema path constant; a check registry whose ids must match the schema ids so the code
+holds no second copy of the contract; the five props-only record checks including the resolution derived
+from the index bits; the two dataset gates that raise instead of scoring; the run flow from extraction
+through gates, per-record evaluation, tallies, weighted score, threshold, report and exit code; the report
+field list with failures-only rows; and the boundaries (geometry not asserted, score before filtering, the
+sim report remaining the line 104 artefact).
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 5,989 in · 2,161 out · 1,035,360 cache-read · 2,582 reasoning · 3 API calls
+- Basis: delta since baseline (2026-09-22T18:31:40+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 08:02 SAST
