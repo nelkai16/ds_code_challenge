@@ -652,3 +652,36 @@ gate ids, both gates fire, the weighted score degrades to 99.98 on two bad recor
 - Tokens: 91,755 in · 46,839 out · 2,473,088 cache-read · 24,745 reasoning · 27 API calls
 - Aux calls (compression): 29,210 in · 17,245 out · 1 API call
 - Basis: delta since baseline (2026-09-23T05:58:04+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 09:29 SAST
+
+## Interaction 31 — 2026-09-23 09:42 SAST
+
+### Prompt
+Good. Finish the final outstanding items for Section 1. You once again have full perms for the dir. Report back with your final changes.
+
+### Response
+Closed items 3 and 9 with the granted permission.
+
+- The line 104 cross-check now runs inside `main()` instead of sitting commented out at the bottom of the
+  file: `crossCheck()` reduces both sides to the three shared fields, refuses to pair them unless the two
+  index sets are equal, then calls `deepValidation()` for the per-record similarity detail and
+  `cheapValidation()` for the hash comparison. Comparing whole records would have scored the extract down for
+  a `resolution` field the reference file never had, so both sides are projected first, and the index-set
+  equality gate closes the zip-truncation hole where a missing record still averages 100.
+- `deepValidation()` returns its detail rows and writes `validation_results.json`; its old
+  `cheap_validation_results.json` writer (two JSON documents in one file, unreadable by any parser) is gone.
+- `validation_report.json` grew a `cross_check` block; the run now exits 1 if either the conformance score
+  falls under the threshold or the cross-check is not identical.
+- Tracked-artefacts decision: `r8_hexagons.geojson`, `schema.yml`, `requirements.txt` and
+  `validation_report.json` stay tracked as reviewable evidence; the append-only run log and the 397 KB
+  per-record similarity detail are build products and are now ignored, with `validation.log` untracked from
+  git (`git rm --cached`) because it grew 700 KB per run.
+
+Measured on the real run: 3,832 records, cross-check 3,832 compared, similarity min 100 / mean 100.0 / max
+100, 0 records below 100, identical true, 0.481 s; extract 2.779 s, reference 0.319 s, checks 0.094 s, 3.713 s
+total, exit 0.
+
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 68,019 in · 23,336 out · 1,043,456 cache-read · 9,454 reasoning · 12 API calls
+- Aux calls (approval, compression): 18,505 in · 13,544 out · 2 API calls
+- Basis: delta since baseline (2026-09-23T07:29:45+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 09:41 SAST

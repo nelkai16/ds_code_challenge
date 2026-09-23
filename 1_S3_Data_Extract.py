@@ -1,14 +1,15 @@
 """Section 1 - extract the H3 resolution 8 hexagon set and validate the extract.
 
-Extracts the resolution 8 slice of city-hex-polygons-8-10.geojson with S3 SELECT, writes the
-dataset out, and scores it against the conformance contract in schema.yml. The provided
-city-hex-polygons-8.geojson file is the correctness oracle for the separate cross-check, not the
-yardstick for the score.
+Extracts the resolution 8 slice of city-hex-polygons-8-10.geojson with S3 SELECT, writes the dataset out,
+then validates it two ways: it is scored against the conformance contract in schema.yml, and it is
+cross-checked against the provided city-hex-polygons-8.geojson, which is the correctness oracle for the
+fields the two files share.
 
 Outputs, all written to the repository root:
-  r8_hexagons.geojson     the extracted dataset, features ordered by index
-  validation_report.json  conformance score, per check tallies, timings, failures
-  validation.log          full run log: one line per record, timings and byte counts
+  r8_hexagons.geojson      the extracted dataset, features ordered by index
+  validation_report.json   conformance score, cross-check result, per check tallies, timings, failures
+  validation_results.json  per record similarity to the reference file, written by the cross-check
+  validation.log           full run log: one line per record, run summary, timings and byte counts
 """
 
 #Personally would rather use DB validation based on triggers and stored procs, would treat this as a daily load/once off load
@@ -46,13 +47,15 @@ SCHEMA = "schema.yml"
 LOG = "validation.log"
 REPORT = "validation_report.json"
 EXTRACT = "r8_hexagons.geojson"
+DETAIL = "validation_results.json"
 
 RESOLUTION_BITS = 52  # H3 packs the resolution into the four highest bits of the 64 bit index
+SHARED_FIELDS = ("index", "centroid_lat", "centroid_lon")  # the fields the extract and the reference share
 
 logger = logging.getLogger("validation")
 
-# Populated by main() so the report carries the timings and byte counts of the run that produced it.
-RUN: dict[str, Any] = {"timings": {}, "bytes": {}}
+# Populated by main() so the report carries the timings, byte counts and cross-check result of the run.
+RUN: dict[str, Any] = {"timings": {}, "bytes": {}, "cross_check": {}}
 CONTRACT = {}
 
 
@@ -118,12 +121,17 @@ class jsonConv:
 
 
 def canon(props):
-    shared = {k: props[k] for k in ("index", "centroid_lat", "centroid_lon")}
+    shared = {k: props[k] for k in SHARED_FIELDS}
     blob = json.dumps(shared, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def deepValidation(json1, json2):
+    """Pair the two sides by sorted index and record how similar each pair is.
+
+    Returns the detail rows; it also writes them to validation_results.json as the record of the
+    cross-check.
+    """
     newSchema = []
 
     sorted_json1 = sorted(json1, key=lambda x: x["index"])
@@ -142,8 +150,9 @@ def deepValidation(json1, json2):
             * 100,
         }
         newSchema.append(obj)
-    with open("validation_results.json", "w") as f:
-        json.dump(newSchema, f, indent=4)
+    with open(DETAIL, "w", encoding="utf-8") as detail_file:
+        json.dump(newSchema, detail_file, indent=4)
+    return newSchema
 
 
 def cheapValidation(json1, json2):
@@ -152,9 +161,66 @@ def cheapValidation(json1, json2):
     return hashes1 == hashes2
 
 
+def project(record):
+    """Reduce a record to the fields the extract and the reference file share.
+
+    The reference has no resolution attribute and the extract carries fields it does not, so both sides are
+    reduced to the shared set before they are compared. Comparing them whole would score the extract down for
+    fields the reference was never expected to have.
+    """
+    return {field: record[field] for field in SHARED_FIELDS if field in record}
+
+
+def crossCheck(records, reference):
+    """Validate the extract against the provided reference file, README line 104.
+
+    Returns a summary of the comparison; the per record similarity detail is written to disk by
+    deepValidation, and only once both sides are known to cover the same indices, because pairs are formed
+    by sorted position and zip would silently truncate a short side and still look perfect.
+    """
+    summary = {
+        "reference": validationFile,
+        "records_extracted": len(records),
+        "records_reference": len(reference),
+        "index_sets_equal": False,
+        "identical": False,
+    }
+
+    if not records or not reference:
+        summary["reason"] = "one side is empty, there is nothing to compare"
+        logger.error("cross check skipped: %s", summary["reason"])
+        return summary
+
+    projected = [project(record) for record in records]
+    expected = [project(record) for record in reference]
+
+    if any(field not in record for record in projected for field in SHARED_FIELDS):
+        summary["reason"] = "a record is missing one of the shared fields"
+        logger.error("cross check skipped: %s", summary["reason"])
+        return summary
+
+    summary["index_sets_equal"] = {r["index"] for r in projected} == {r["index"] for r in expected}
+    if not summary["index_sets_equal"]:
+        summary["reason"] = "the two sides do not cover the same indices"
+        logger.error("cross check failed: %s", summary["reason"])
+        return summary
+
+    detail = deepValidation(projected, expected)
+    similarity = [row["sim"] for row in detail]
+    summary["records_compared"] = len(detail)
+    summary["similarity_min"] = round(min(similarity), 6)
+    summary["similarity_mean"] = round(sum(similarity) / len(similarity), 6)
+    summary["similarity_max"] = round(max(similarity), 6)
+    summary["records_below_100"] = sum(1 for value in similarity if value < 100)
+    summary["identical"] = (
+        cheapValidation(projected, expected) and summary["records_below_100"] == 0
+    )
+    return summary
+
+
 def check_required_keys(record):
     """index, centroid_lat and centroid_lon must be present on the record."""
-    missing = sorted({"index", "centroid_lat", "centroid_lon"} - set(record))
+    missing = sorted(set(SHARED_FIELDS) - set(record))
     if missing:
         return False, f"missing keys: {missing}"
     return True, ""
@@ -187,8 +253,8 @@ def check_resolution_is_8(record):
     return True, ""
 
 
-# One implementation per check id the schema may declare. The schema drives which checks run, so
-# the contract itself is never duplicated here.
+# One implementation per check id the schema may declare. The schema drives which checks run, so the
+# contract itself is never duplicated here.
 CHECKS = {
     "required_keys": check_required_keys,
     "index_format": check_index_format,
@@ -247,8 +313,8 @@ def evaluate_gates(records, contract):
 def evaluate_checks(records, contract):
     """Evaluate every declared check against every record as extracted.
 
-    Returns the per check tallies, the failures keyed by index, and how many records failed at
-    least one check.
+    Returns the per check tallies, the failures keyed by index, and how many records failed at least one
+    check.
     """
     tally = {
         check["id"]: {"passing": 0, "failing": 0} for check in contract["record_checks"]
@@ -290,8 +356,8 @@ def score_records(tally, contract, total):
 def write_extract(records, path):
     """Write the extracted dataset as a GeoJSON FeatureCollection, ordered by index.
 
-    The query selects properties only, so geometry is carried as null. Section 2 joins on the
-    hexagon index, so geometry is not needed for that join.
+    The query selects properties only, so geometry is carried as null. Section 2 joins on the hexagon
+    index, so geometry is not needed for that join.
     """
     collection = {
         "type": "FeatureCollection",
@@ -306,7 +372,7 @@ def write_extract(records, path):
 
 
 def writeReport(failure, tally, score, status):
-    """Write the conformance report. Timings and byte counts are read from RUN."""
+    """Write the conformance report. Timings, byte counts and the cross-check result come from RUN."""
     weights = {check["id"]: check["weight"] for check in CONTRACT["record_checks"]}
     report = {
         "schema": SCHEMA,
@@ -325,6 +391,7 @@ def writeReport(failure, tally, score, status):
             }
             for check_id, counts in tally.items()
         },
+        "cross_check": RUN["cross_check"],
         "timings_seconds": RUN["timings"],
         "bytes": RUN["bytes"],
         "failures": failure,
@@ -355,7 +422,7 @@ def configure_logging():
 
 
 def main():
-    """Extract the resolution 8 set, write it out, and score it against the contract."""
+    """Extract the resolution 8 set, write it out, and validate it against the contract and the reference."""
     global CONTRACT
 
     configure_logging()
@@ -412,6 +479,11 @@ def main():
     RUN["records_failing"] = records_failing
     RUN["records_passing"] = len(queriedJson) - records_failing
 
+    tick = time.perf_counter()
+    RUN["cross_check"] = crossCheck(queriedJson, validationJson)
+    RUN["timings"]["cross_check"] = round(time.perf_counter() - tick, 3)
+    logger.info("cross check against %s: %s", validationFile, RUN["cross_check"])
+
     score = score_records(tally, CONTRACT, len(queriedJson))
     status = "PASS" if score >= CONTRACT["threshold"] else "FAIL"
     writeReport(failure, tally, score, status)
@@ -442,22 +514,15 @@ def main():
     logger.info("timings in seconds: %s", RUN["timings"])
     logger.info("bytes: %s", RUN["bytes"])
 
-    sys.exit(0 if status == "PASS" else 1)
+    cross_ok = bool(RUN["cross_check"].get("identical"))
+    logger.info(
+        "identical to %s: %s | exit %s",
+        validationFile,
+        cross_ok,
+        0 if (status == "PASS" and cross_ok) else 1,
+    )
 
-
-# Cross-check against the provided file, line 104. Re-enable by calling these from inside main(),
-# where queriedJson and validationJson now live.
-# if cheapValidation(queriedJson, validationJson):
-#     with open("cheap_validation_results.json", "w") as f:
-#         json.dump("The two JSON objects are equivalent.", f)
-#         json.dump(queriedJson, f)
-# else:
-#     with open("cheap_validation_results.json", "w") as f:
-#         json.dump("The two JSON objects are not equivalent.\n", f)
-#         json.dump(queriedJson, f)
-#         json.dump(validationJson, f)
-
-# deepValidation(queriedJson, validationJson)
+    sys.exit(0 if status == "PASS" and cross_ok else 1)
 
 
 if __name__ == "__main__":

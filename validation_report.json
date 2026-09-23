@@ -29,12 +29,25 @@
             "failing": 0
         }
     },
+    "cross_check": {
+        "reference": "city-hex-polygons-8.geojson",
+        "records_extracted": 3832,
+        "records_reference": 3832,
+        "index_sets_equal": true,
+        "identical": true,
+        "records_compared": 3832,
+        "similarity_min": 100,
+        "similarity_mean": 100.0,
+        "similarity_max": 100,
+        "records_below_100": 0
+    },
     "timings_seconds": {
-        "extract_source": 2.963,
-        "extract_reference": 0.236,
+        "extract_source": 2.779,
+        "extract_reference": 0.319,
         "gates": 0.0003,
-        "write_extract": 0.028,
-        "checks": 0.09
+        "write_extract": 0.037,
+        "checks": 0.094,
+        "cross_check": 0.481
     },
     "bytes": {
         "source": {
