@@ -1,0 +1,4 @@
+boto3==1.43.99
+deepdiff==9.1.0
+PyYAML==6.0.3
+requests==2.34.2

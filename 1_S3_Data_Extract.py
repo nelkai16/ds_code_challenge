@@ -1,16 +1,59 @@
-import string
+"""Section 1 - extract the H3 resolution 8 hexagon set and validate the extract.
 
-import deepdiff
-import boto3
+Extracts the resolution 8 slice of city-hex-polygons-8-10.geojson with S3 SELECT, writes the
+dataset out, and scores it against the conformance contract in schema.yml. The provided
+city-hex-polygons-8.geojson file is the correctness oracle for the separate cross-check, not the
+yardstick for the score.
+
+Outputs, all written to the repository root:
+  r8_hexagons.geojson     the extracted dataset, features ordered by index
+  validation_report.json  conformance score, per check tallies, timings, failures
+  validation.log          full run log: one line per record, timings and byte counts
+"""
+
+#Personally would rather use DB validation based on triggers and stored procs, would treat this as a daily load/once off load
+#DB triggers+validation should be hardened enough to reject bad data
+#All actions should be piped to a log table
+#Would rather keep the integration on DB side to avoid having to manage multiple moving parts in the data pipeline
+#As well as having logs easily accessible in the DB for auditing and debugging purposes
+#Python would be good for integration layer or to push to DB
+#Though that would depend on if this a once off load or expected daily interface
+
 import hashlib
 import json
+import logging
+import string
+import sys
+import time
+from typing import Any
+
+import boto3
+import deepdiff
 import requests
-import operator
+import yaml
 
 bucket_name = "cct-ds-code-challenge-input-data"
 keys = "ds_code_challenge_creds.json"
 url = "https://cct-ds-code-challenge-input-data.s3.af-south-1.amazonaws.com/"
 region = "af-south-1"
+
+resQuery = "SELECT s.properties.* FROM S3Object[*].features[*] s where s.properties.resolution = 8"
+resFile = "city-hex-polygons-8-10.geojson"
+validationQuery = "SELECT s.properties.index, s.properties.centroid_lat, s.properties.centroid_lon FROM S3Object[*].features[*] s"
+validationFile = "city-hex-polygons-8.geojson"
+
+SCHEMA = "schema.yml"
+LOG = "validation.log"
+REPORT = "validation_report.json"
+EXTRACT = "r8_hexagons.geojson"
+
+RESOLUTION_BITS = 52  # H3 packs the resolution into the four highest bits of the 64 bit index
+
+logger = logging.getLogger("validation")
+
+# Populated by main() so the report carries the timings and byte counts of the run that produced it.
+RUN: dict[str, Any] = {"timings": {}, "bytes": {}}
+CONTRACT = {}
 
 
 class grabKeys:
@@ -28,7 +71,7 @@ class grabKeys:
             secret_key = data["s3"]["secret_key"]
             return access_key, secret_key
         else:
-            print(f"Request failed with status code {response.status_code}")
+            logger.warning("Request failed with status code %s", response.status_code)
             return None, None
 
 
@@ -56,29 +99,22 @@ class S3Select:
         return resp
 
 
-class printRecords:
-    def __init__(self, response):
-        self.response = response
-
-    def print_data(self):
-        for event in self.response["Payload"]:
-            if "Records" in event:
-                records = event["Records"]["Payload"].decode("utf-8")
-                print(records, end="")
-
-
 class jsonConv:
+    """Turns an S3 SELECT payload stream into records, and keeps the bytes it scanned."""
+
     def __init__(self, response):
         self.response = response
+        self.stats = {}
 
     def convert_to_json(self):
         buf = bytearray()
         for event in self.response["Payload"]:
             if "Records" in event:
                 buf += event["Records"]["Payload"]  # accumulate across every event
+            elif "Stats" in event:
+                self.stats = event["Stats"]["Details"]
         lines = [l for l in buf.decode("utf-8").split("\n") if l.strip()]
-        records = [json.loads(l) for l in lines]
-        return records
+        return [json.loads(l) for l in lines]
 
 
 def canon(props):
@@ -115,74 +151,302 @@ def cheapValidation(json1, json2):
     hashes2 = sorted(canon(record) for record in json2)
     return hashes1 == hashes2
 
-def evaluate_gates(records):
-    count_positive = len(records) > 0
-    index_unique = len({r.get("index") for r in records}) == len(records)
-    
-    if count_positive and index_unique:
-        return True
-    else:
-        print("Validation failed: Either no records found or duplicate indices present.")
-        return False
-        
-def record_checks(record):
-    reason = ""
-    keys_exact = {"index", "centroid_lat", "centroid_lon"}.issubset(record.keys())
-    idx_str = record.get("index", "")
-    index_format = (
-        isinstance(idx_str, str) and
-        len(idx_str) == 15 and 
-        idx_str.startswith('8') and 
-        all(c in string.hexdigits.lower() for c in idx_str)
-    )
-    resolution_is_8 = False
-    if index_format and record.get("resolution") == 8:
-        idx_int = int(idx_str, 16)
-        extracted_res = (idx_int >> 52) & 0xF
-        resolution_is_8 = (extracted_res == 8)
-        
-    if keys_exact and index_format and resolution_is_8:
-        return True
-    else:
-        switch = {
-            not keys_exact: "Missing required keys.",
-            not index_format: "Index format is incorrect.",
-            not resolution_is_8: "Resolution extracted from index is not 8.",
-        }
-        for condition, message in switch.items():
-            if condition:
-                reason = message
-                break
-        print(f"Record {record.get('index', 'Unknown')} NOT OK. Reason = {reason}")
-        return False
 
-resQuery = "SELECT s.properties.* FROM S3Object[*].features[*] s where s.properties.resolution = 8"
-resFile = "city-hex-polygons-8-10.geojson"
-validationQuery = "SELECT s.properties.index, s.properties.centroid_lat, s.properties.centroid_lon FROM S3Object[*].features[*] s"
-validationFile = "city-hex-polygons-8.geojson"
-SCHEMA = 'schema.yml'
-failure={}
+def check_required_keys(record):
+    """index, centroid_lat and centroid_lon must be present on the record."""
+    missing = sorted({"index", "centroid_lat", "centroid_lon"} - set(record))
+    if missing:
+        return False, f"missing keys: {missing}"
+    return True, ""
 
-queriedProps = S3Select(url, region, keys).select_data(bucket_name, resFile, resQuery)
-validationProps = S3Select(url, region, keys).select_data(
-    bucket_name, validationFile, validationQuery
-)
-queriedJson = jsonConv(queriedProps).convert_to_json()
-validationJson = jsonConv(validationProps).convert_to_json()
 
-isvalid = evaluate_gates(queriedJson)
-if isvalid:
-    for r in queriedJson:
-        idx = r.get("index","Unknown")
+def check_index_format(record):
+    """The index must be 15 lowercase hex characters carrying the resolution 8 prefix."""
+    idx = record.get("index", "")
+    if not isinstance(idx, str):
+        return False, f"index is {type(idx).__name__}, expected str"
+    if len(idx) != 15:
+        return False, f"index is {len(idx)} characters, expected 15"
+    if idx != idx.lower() or any(char not in string.hexdigits.lower() for char in idx):
+        return False, "index is not lowercase hex"
+    if not idx.startswith("8"):
+        return False, "index does not carry the resolution 8 prefix"
+    return True, ""
 
-        if record_checks(r):
-                print(f"Record {idx} OK. Reason = {r}")
+
+def check_resolution_is_8(record):
+    """The resolution attribute must be the integer 8 and agree with the bits in the index."""
+    ok, reason = check_index_format(record)
+    if not ok:
+        return False, f"resolution cannot be derived, {reason}"
+    if record.get("resolution") != 8:
+        return False, f"resolution attribute is {record.get('resolution')!r}, expected 8"
+    derived = (int(record["index"], 16) >> RESOLUTION_BITS) & 0xF
+    if derived != 8:
+        return False, f"resolution derived from index is {derived}, expected 8"
+    return True, ""
+
+
+# One implementation per check id the schema may declare. The schema drives which checks run, so
+# the contract itself is never duplicated here.
+CHECKS = {
+    "required_keys": check_required_keys,
+    "index_format": check_index_format,
+    "resolution_is_8": check_resolution_is_8,
+}
+
+
+def gate_count_positive(records):
+    if not records:
+        return "the query returned no records"
+    return ""
+
+
+def gate_index_unique(records):
+    indices = {record.get("index") for record in records}
+    if len(indices) != len(records):
+        return f"{len(records) - len(indices)} duplicate indices present"
+    return ""
+
+
+GATES = {
+    "count_positive": gate_count_positive,
+    "index_unique": gate_index_unique,
+}
+
+
+def load_schema(path):
+    """Read the conformance contract and check it against what is actually implemented."""
+    with open(path, encoding="utf-8") as schema_file:
+        contract = yaml.safe_load(schema_file)
+
+    unknown = sorted({check["id"] for check in contract["record_checks"]} - set(CHECKS))
+    if unknown:
+        raise ValueError(f"{path} declares checks with no implementation: {unknown}")
+
+    total_weight = sum(check["weight"] for check in contract["record_checks"])
+    if round(total_weight, 6) != 1.0:
+        raise ValueError(f"{path} weights sum to {total_weight}, expected 1.0")
+
+    for gate in contract["dataset_gates"]:
+        if gate["id"] not in GATES:
+            raise ValueError(f"{path} declares a gate with no implementation: {gate['id']}")
+
+    return contract
+
+
+def evaluate_gates(records, contract):
+    """Dataset level gates. A failure stops the run rather than lowering the score."""
+    return [
+        f"{gate['id']}: {reason}"
+        for gate in contract["dataset_gates"]
+        if (reason := GATES[gate["id"]](records))
+    ]
+
+
+def evaluate_checks(records, contract):
+    """Evaluate every declared check against every record as extracted.
+
+    Returns the per check tallies, the failures keyed by index, and how many records failed at
+    least one check.
+    """
+    tally = {
+        check["id"]: {"passing": 0, "failing": 0} for check in contract["record_checks"]
+    }
+    failure = {}
+    records_failing = 0
+
+    for record in records:
+        idx = record.get("index", "Unknown")
+        failed_here = False
+        for check in contract["record_checks"]:
+            ok, reason = CHECKS[check["id"]](record)
+            if ok:
+                tally[check["id"]]["passing"] += 1
+                continue
+            tally[check["id"]]["failing"] += 1
+            failed_here = True
+            failure.setdefault(idx, []).append({"check": check["id"], "reason": reason})
+            logger.warning("record %s failed %s: %s", idx, check["id"], reason)
+        if failed_here:
+            records_failing += 1
         else:
-             print(f"Record {idx} NOT OK. Reason = {r}")
-             failure.setdefault(idx, []).append({"validation_error": r})
-else:
-    print("Validation failed: Either no records found or duplicate indices present.")
+            logger.debug("record %s passed every check: %s", idx, record)
 
+    return tally, failure, records_failing
+
+
+def score_records(tally, contract, total):
+    """Weighted pass rate across the declared checks, as a percentage."""
+    if not total:
+        return 0.0
+    weighted = sum(
+        check["weight"] * tally[check["id"]]["passing"] / total
+        for check in contract["record_checks"]
+    )
+    return round(100 * weighted, 2)
+
+
+def write_extract(records, path):
+    """Write the extracted dataset as a GeoJSON FeatureCollection, ordered by index.
+
+    The query selects properties only, so geometry is carried as null. Section 2 joins on the
+    hexagon index, so geometry is not needed for that join.
+    """
+    collection = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "properties": record, "geometry": None}
+            for record in sorted(records, key=lambda record: record.get("index", ""))
+        ],
+    }
+    with open(path, "w", encoding="utf-8") as extract_file:
+        json.dump(collection, extract_file, indent=4)
+    return path
+
+
+def writeReport(failure, tally, score, status):
+    """Write the conformance report. Timings and byte counts are read from RUN."""
+    weights = {check["id"]: check["weight"] for check in CONTRACT["record_checks"]}
+    report = {
+        "schema": SCHEMA,
+        "dataset": CONTRACT["dataset"],
+        "threshold": CONTRACT["threshold"],
+        "records_evaluated": RUN["records_evaluated"],
+        "records_passing": RUN["records_passing"],
+        "records_failing": RUN["records_failing"],
+        "score": score,
+        "status": status,
+        "checks": {
+            check_id: {
+                "weight": weights[check_id],
+                "passing": counts["passing"],
+                "failing": counts["failing"],
+            }
+            for check_id, counts in tally.items()
+        },
+        "timings_seconds": RUN["timings"],
+        "bytes": RUN["bytes"],
+        "failures": failure,
+    }
+    with open(REPORT, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, indent=4)
+    return REPORT
+
+
+def configure_logging():
+    """Log every record to validation.log, and the run summary to the console as well."""
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    log_file = logging.FileHandler(LOG, mode="a", encoding="utf-8")
+    log_file.setLevel(logging.DEBUG)
+    log_file.setFormatter(formatter)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+
+    logger.addHandler(log_file)
+    logger.addHandler(console)
+    logger.info("%s", "-" * 70)
+
+
+def main():
+    """Extract the resolution 8 set, write it out, and score it against the contract."""
+    global CONTRACT
+
+    configure_logging()
+    started = time.perf_counter()
+    CONTRACT = load_schema(SCHEMA)
+    logger.info("run start: contract %s, threshold %s", SCHEMA, CONTRACT["threshold"])
+
+    tick = time.perf_counter()
+    queried = jsonConv(
+        S3Select(url, region, keys).select_data(bucket_name, resFile, resQuery)
+    )
+    queriedJson = queried.convert_to_json()
+    RUN["timings"]["extract_source"] = round(time.perf_counter() - tick, 3)
+    RUN["bytes"]["source"] = queried.stats
+    logger.info(
+        "extracted %s records from %s in %ss (%s)",
+        len(queriedJson),
+        resFile,
+        RUN["timings"]["extract_source"],
+        queried.stats,
+    )
+
+    tick = time.perf_counter()
+    reference = jsonConv(
+        S3Select(url, region, keys).select_data(bucket_name, validationFile, validationQuery)
+    )
+    validationJson = reference.convert_to_json()
+    RUN["timings"]["extract_reference"] = round(time.perf_counter() - tick, 3)
+    RUN["bytes"]["reference"] = reference.stats
+    logger.info(
+        "fetched %s records from %s in %ss (%s)",
+        len(validationJson),
+        validationFile,
+        RUN["timings"]["extract_reference"],
+        reference.stats,
+    )
+
+    tick = time.perf_counter()
+    gate_errors = evaluate_gates(queriedJson, CONTRACT)
+    RUN["timings"]["gates"] = round(time.perf_counter() - tick, 4)
+    if gate_errors:
+        logger.error("dataset gates failed: %s", "; ".join(gate_errors))
+        sys.exit(1)
+
+    tick = time.perf_counter()
+    write_extract(queriedJson, EXTRACT)
+    RUN["timings"]["write_extract"] = round(time.perf_counter() - tick, 3)
+    logger.info("wrote %s", EXTRACT)
+
+    tick = time.perf_counter()
+    tally, failure, records_failing = evaluate_checks(queriedJson, CONTRACT)
+    RUN["timings"]["checks"] = round(time.perf_counter() - tick, 3)
+    RUN["records_evaluated"] = len(queriedJson)
+    RUN["records_failing"] = records_failing
+    RUN["records_passing"] = len(queriedJson) - records_failing
+
+    score = score_records(tally, CONTRACT, len(queriedJson))
+    status = "PASS" if score >= CONTRACT["threshold"] else "FAIL"
+    writeReport(failure, tally, score, status)
+
+    RUN["timings"]["total"] = round(time.perf_counter() - started, 3)
+    weights = {check["id"]: check["weight"] for check in CONTRACT["record_checks"]}
+    for check_id, counts in tally.items():
+        logger.info(
+            "check %s (weight %s): %s passing, %s failing",
+            check_id,
+            weights[check_id],
+            counts["passing"],
+            counts["failing"],
+        )
+    logger.info(
+        "records evaluated %s, passing %s, failing %s",
+        RUN["records_evaluated"],
+        RUN["records_passing"],
+        RUN["records_failing"],
+    )
+    logger.info(
+        "score %s against threshold %s -> %s (report: %s)",
+        score,
+        CONTRACT["threshold"],
+        status,
+        REPORT,
+    )
+    logger.info("timings in seconds: %s", RUN["timings"])
+    logger.info("bytes: %s", RUN["bytes"])
+
+    sys.exit(0 if status == "PASS" else 1)
+
+
+# Cross-check against the provided file, line 104. Re-enable by calling these from inside main(),
+# where queriedJson and validationJson now live.
 # if cheapValidation(queriedJson, validationJson):
 #     with open("cheap_validation_results.json", "w") as f:
 #         json.dump("The two JSON objects are equivalent.", f)
@@ -194,3 +458,7 @@ else:
 #         json.dump(validationJson, f)
 
 # deepValidation(queriedJson, validationJson)
+
+
+if __name__ == "__main__":
+    main()

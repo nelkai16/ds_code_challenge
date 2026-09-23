@@ -1,0 +1,37 @@
+# Conformance contract for the section 1 extraction output.
+#
+# The extractor reads this file and scores the records it produced against it. Nothing here
+# refers to the provided city-hex-polygons-8.geojson: that file is the correctness oracle used
+# by the separate cross-check, not the yardstick for this score. Delete this file and the score
+# cannot be computed at all; delete the reference file and the cross-check dies but this still runs.
+#
+# Record checks are weighted and must sum to 1.0. The score is the weighted pass rate across the
+# checks, expressed as a percentage, so it degrades in proportion to what actually broke rather
+# than collapsing to pass or fail on a single boolean.
+
+dataset:
+  source: city-hex-polygons-8-10.geojson
+  filter: properties.resolution = 8
+  scope: properties only, geometry is not asserted by this contract
+  expected_records: 3832
+
+# Percent. At 3,832 records one record failing every check costs 0.03 of a point, so a threshold
+# near 95 only catches a broadly broken extract.
+threshold: 95
+
+record_checks:
+  - id: required_keys
+    weight: 0.30
+    description: index, centroid_lat and centroid_lon are present on every record
+  - id: index_format
+    weight: 0.35
+    description: index is 15 lowercase hex characters carrying the resolution 8 prefix
+  - id: resolution_is_8
+    weight: 0.35
+    description: the resolution attribute is the integer 8 and agrees with the bits encoded in the index
+
+# Dataset level gates. These are pass or fail for the run as a whole: scoring them as a fraction
+# of records would swing the whole result on a single boolean, so a failure stops the run instead.
+dataset_gates:
+  - id: count_positive
+  - id: index_unique

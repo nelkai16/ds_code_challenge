@@ -1,0 +1,52 @@
+{
+    "schema": "schema.yml",
+    "dataset": {
+        "source": "city-hex-polygons-8-10.geojson",
+        "filter": "properties.resolution = 8",
+        "scope": "properties only, geometry is not asserted by this contract",
+        "expected_records": 3832
+    },
+    "threshold": 95,
+    "records_evaluated": 3832,
+    "records_passing": 3832,
+    "records_failing": 0,
+    "score": 100.0,
+    "status": "PASS",
+    "checks": {
+        "required_keys": {
+            "weight": 0.3,
+            "passing": 3832,
+            "failing": 0
+        },
+        "index_format": {
+            "weight": 0.35,
+            "passing": 3832,
+            "failing": 0
+        },
+        "resolution_is_8": {
+            "weight": 0.35,
+            "passing": 3832,
+            "failing": 0
+        }
+    },
+    "timings_seconds": {
+        "extract_source": 2.963,
+        "extract_reference": 0.236,
+        "gates": 0.0003,
+        "write_extract": 0.028,
+        "checks": 0.09
+    },
+    "bytes": {
+        "source": {
+            "BytesScanned": 108254980,
+            "BytesProcessed": 108254980,
+            "BytesReturned": 451301
+        },
+        "reference": {
+            "BytesScanned": 1966685,
+            "BytesProcessed": 1966685,
+            "BytesReturned": 393821
+        }
+    },
+    "failures": {}
+}

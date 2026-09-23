@@ -570,3 +570,85 @@ sim report remaining the line 104 artefact).
 - Model: deepseek-v4-flash (provider: deepseek)
 - Tokens: 5,989 in · 2,161 out · 1,035,360 cache-read · 2,582 reasoning · 3 API calls
 - Basis: delta since baseline (2026-09-22T18:31:40+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 08:02 SAST
+
+## Interaction 28 — 2026-09-23 08:05 SAST
+
+### Prompt
+Okay done most. Could you write the write_report() for me and NOTHING else.
+
+### Response
+Read his current script (234 lines) and wrote only the body of `writeReport`, keeping his signature and
+his data shapes, delivering it in chat rather than editing the file so his open buffer stays clean. The
+function writes one JSON object — schema path, threshold, counted records, passing, failing, score,
+status and the failures — which also avoids the concatenated-document problem. Flagged two call-site
+issues without changing them: the call sits inside the per-record loop and passes `status` before it is
+assigned, which raises `NameError` on the first record, and calling it each iteration rewrites the file
+3,832 times.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 6,402 in · 4,040 out · 1,045,120 cache-read · 3,055 reasoning · 6 API calls
+- Basis: delta since baseline (2026-09-22T18:31:40+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 08:05 SAST
+
+## Interaction 29 — 2026-09-23 08:10 SAST
+
+### Prompt
+What else needs to be done now?
+
+### Response
+Checked the repo and his `validation_report.json` (3,832 evaluated, 3,832 passing, 0 failing, score 100,
+PASS), confirming the report writer landed and the run completed. Listed the remaining section 1 items:
+`schema.yml` does not exist although the report cites it and the checks still live in code, so the line 106
+standalone schema file is unmet; the per-record checks are binary and ANDed, so the score can only reach 100
+or 99.97 at this scale and threshold 95 cannot discriminate; the reference cross-check is commented out, so
+the line 104 validation no longer runs; timing and stats logging is untouched; nothing writes the extraction
+artefact; a failed gate prints and still exits 0, and `exit_code` is computed but unused; the per-record
+logging opens `validation.log` 3,832 times per run and appends without a run separator; requirements file,
+ignore rules, entry-point guard and docstrings are still absent and `printRecords` plus `deepValidation` are
+now dead code.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 6,935 in · 2,007 out · 1,055,872 cache-read · 2,363 reasoning · 4 API calls
+- Basis: delta since baseline (2026-09-22T18:31:40+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 08:10 SAST
+
+## Interaction 30 — 2026-09-23 09:30 SAST
+
+### Prompt
+Fix 1,2,4,5,6,7,8. For this one time, you have full dir permissions as needed. Want to get this done and move on.
+
+### Response
+Backed the script up to scratch, then fixed seven of the nine open items, leaving the commented cross-check
+and the tracked-artefacts decision untouched as instructed.
+
+- schema.yml created: dataset, threshold, three weighted record checks summing to 1.0, two dataset gates, and
+  a note that geometry is not asserted. The script now loads it and refuses to run if a declared check, gate
+  or weight is unusable, so the contract lives in the file and the code only holds the implementations.
+- Scoring replaced with a weighted pass rate across checks, rounded to two decimals: two bad records now score
+  99.98 instead of a number that could only be 100 or 99.97.
+- Timing and byte accounting added: per stage wall clock, the S3 SELECT Stats events for both queries, all
+  written to the report and the log. Measured on the real run: 2.963 s to extract from the 108,254,980 byte
+  source returning 451,301 bytes, 0.236 s for the 1,966,685 byte reference file, 0.09 s for the checks,
+  3.32 s total.
+- r8_hexagons.geojson written as a GeoJSON FeatureCollection, 3,832 features ordered by index, geometry null
+  because the query selects properties only.
+- Gate failure now exits 1, and the pass/fail status drives the exit code too.
+- Logging moved to the logging module: one file handle, a run separator, full record trace at debug, failures
+  and the summary at info, so no more 3,832 opens per run.
+- Hygiene: requirements.txt with the four pinned dependencies, .gitignore for the venv and caches, an entry
+  point guard so importing the module no longer hits the network, docstrings throughout, and the dead
+  printRecords class removed.
+
+Verified by running the script (exit 0, 3,832 records, all checks passing, score 100.0, PASS) and by a
+read-only harness in scratch that confirms the schema guards reject unbalanced weights and unknown check or
+gate ids, both gates fire, the weighted score degrades to 99.98 on two bad records, the artefact parses with
+3,832 distinct sorted indices, and the report carries every field including timings and byte counts.
+
+### Usage
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 91,755 in · 46,839 out · 2,473,088 cache-read · 24,745 reasoning · 27 API calls
+- Aux calls (compression): 29,210 in · 17,245 out · 1 API call
+- Basis: delta since baseline (2026-09-23T05:58:04+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 09:29 SAST
