@@ -4,6 +4,133 @@ One block per interaction, oldest first. Prompts verbatim, responses condensed t
 produced, usage per interaction. Restarted 2026-09-22 15:27 SAST, after the repo was reset to
 commit `e2c6520` and the agent's earlier scaffolding was removed.
 
+## Section 1 — closing summary
+
+Item 1, Data Extraction. Closed 2026-09-23 09:45 SAST at commit `5bbf096`, working tree clean. Line numbers
+below refer to `README.md`. This block summarises the 31 interactions that follow it; the per-interaction
+blocks hold the verbatim prompts and the usage.
+
+### Candidate's work
+
+- Settled the scope from the brief: resolution 8 only, properties rather than geometry, S3 SELECT rather than
+  reading the whole object.
+- Wrote the script: the `grabKeys`, `S3Select` and `jsonConv` classes and the query, the conformance checks,
+  the dataset gates, the tally, `writeReport()`, and the first versions of `canon()`, `cheapValidation()` and
+  `deepValidation()`.
+- Decided the validation shape — two parts, the line 104 comparison against the provided file and the
+  line 106 schema conformance score written to its own file — and that comparison is on shared properties and
+  never on record order.
+- Decided the outputs and their names, and the weights and threshold that went into `schema.yml`.
+- Ran every version against the live bucket and reported the results back between steps.
+- Reset the repository the one time the AI overstepped, and kept the AI in an advisory role from then on.
+
+### AI's work
+
+- Read `README.md` sections 0 to 2 and probed the source object read-only: 203,840 features, resolution split
+  3,832 / 25,477 / 174,531, three projections measured for payload and latency, and the naive
+  `get_object` + `json.loads` baseline (11.48 s, 689 MB peak).
+- Diagnosed failures from pasted tracebacks and specified the fixes: the payload split parse error, the
+  `hashlib` NameError, the `writeReport()` call site, the unreadable two-document JSON, the gate that exited 0.
+- Answered the design questions: the conformance score in the context of line 106, where the single hashing
+  point belongs, why the cross-check is not the conformance validation, and which files deserve to be separate.
+- Supplied `writeReport()`, and under a one-off grant of directory permissions implemented the nine open items:
+  schema loading, weighted scoring, timing and byte accounting, the extraction artefact, exit codes, the
+  logging module, the hygiene files, the cross-check inside `main()`, and the tracked/ignored artefact split.
+- Verified each change by running it and by a read-only harness in scratch, and reported the measured output.
+
+### Where the candidate corrected the AI
+
+1. The AI began building scaffolding (a `src` package, tests, notes, an initial commit) on "let us begin the
+   work". Corrected: "I do not want you to do the work for me... You doing the work for me defeats the point of
+   this exercise." The AI stopped.
+2. The scaffolding had already been committed. Corrected: "Undo what you do. You began with the incorrect
+   assumption that you will be doing the work. Revert the repo to the state before you touched it." The
+   repository was reset to `e2c6520`, every file the AI created was removed, and the AI reworked its plan as
+   advice rather than delivery.
+3. The AI's answers had grown long. Corrected: "You do not need to be so verbose. I am aware of those issues, I
+   am still working on it. Treat this as a fresh start."
+4. The AI hedged over what "desired schema" meant. Corrected: "This feels like word lawyering and reality this
+   would be an easy answer, instead of the vagueness here." The AI answered directly instead.
+5. The AI's retooling guide went wider than the question. Corrected: "Okay done most. Could you write the
+   write_report() for me and NOTHING else."
+6. The AI had treated the line 104 and line 106 validations as one requirement. The candidate's reading — a raw
+   comparison against the provided file, then an additional schema conformance validation scored into its own
+   file — is the one implemented.
+7. The AI recommended keeping geometry in the artefact. The candidate cut it; the query and the artefact are
+   properties-only, with `geometry: null` in the output and the boundary stated in `schema.yml`.
+
+### Where the AI corrected or improved the candidate's work
+
+1. **Payload splitting.** `json.decoder.JSONDecodeError: Unterminated string starting at line 1 column 80` —
+   `Records` events arrive split at arbitrary byte offsets, so parsing each event on its own truncates records.
+   Fixed by accumulating every payload into one buffer, splitting once on the record delimiter, then parsing.
+2. **Comparing by position.** The first comparison walked both sides in order, and S3 SELECT promises no record
+   order. Replaced with comparison by index key, with one assertion (`len(set) == len(list)`, 3,832 = 3,832)
+   covering duplicates and omissions together.
+3. **An empty set scoring 1.0.** Empty against empty reported "identical". The `count_positive` gate now stops
+   the run with exit 1 before any score exists.
+4. **Zip truncation.** Pairing by sorted position averages 100 even when a record is missing, because `zip`
+   stops at the shorter side. The cross-check now refuses to pair unless the index sets are equal, so a missing
+   record fails the run instead of scoring perfectly.
+5. **A comparison report is not a schema.** `deepValidation()`'s output was being described as the line 106
+   schema. It records how far two extracts are apart, which is not what a schema does; the test is to delete
+   the reference file, after which the report cannot be computed but a schema still describes the data. The
+   desired schema for the data produced is now a standalone `schema.yml` that drives the checks that run.
+6. **A score that could not discriminate.** The score began as a pass fraction rounded to whole percent, which
+   at 3,832 records can only be 100 or 99.97, so threshold 95 could never fail on data quality alone. Now a
+   weighted pass rate across the declared checks at two decimals: two bad records read 99.98.
+7. **`canon()` raised `NameError`** because `hashlib` was never imported, so the hash comparison could not run.
+8. **`writeReport()` was called inside the per-record loop**, passing `status` before it was assigned, so the
+   first record raised `NameError`. It now runs once, after the loop.
+9. **`cheap_validation_results.json` was two JSON documents in one file** — nothing could read it back
+   (`Extra data at char 38`). Replaced by the single valid document `validation_results.json`.
+10. **A failed gate exited 0,** with an `exit_code` computed and never used. A failed gate, a below-threshold
+    score and a failed cross-check all exit 1 now.
+
+### Requirements in `README.md`, and where each is met
+
+- **104 — S3 SELECT for the resolution 8 data.** 3,832 records in 2.779 s, `BytesScanned` 108,254,980,
+  `BytesReturned` 451,301, against 11.48 s and a 689 MB peak for a naive whole-object read.
+- **104 — validate against `city-hex-polygons-8.geojson`.** Both sides reduced to the three shared fields and
+  compared by index and by hash: 3,832 compared, similarity min 100 / mean 100.0 / max 100, 0 records below
+  100, result recorded in the `cross_check` block of `validation_report.json`.
+- **106 — additional schema conformance validation.** `schema.yml` is the standalone desired schema (dataset,
+  threshold 95, three weighted record checks, two dataset gates, scope note); the run scores the extract against
+  it and writes the score, per-check tallies and failures to `validation_report.json`. The score is non-binary
+  by construction.
+- **108 — log the time taken, optimise latency and resources.** Per-stage timings and S3 SELECT `Stats` byte
+  counts go to both the log and the report. Optimisation is predicate pushdown, narrow projection, one pass per
+  source, and no geometry copied that the join does not need.
+- **82 — role-appropriate testing and validation.** Logging, a thresholded conformance score, dataset gates, a
+  hash comparison and a per-record similarity check are all in the script. Gap: no unit or integration test
+  files are committed.
+- **84 — formatting and maintainability.** One module with docstrings, a pinned `requirements.txt`,
+  `.gitignore`, an entry point guard, and no second copy of the contract in code. Gap: no formatter or linter
+  configuration is committed.
+- **96 — use the provided files to validate.** `city-hex-polygons-8.geojson` as the oracle, plus the resolution
+  9 and 10 features inside the source object to confirm the predicate selects exactly 3,832 of 203,840.
+- **58 — AI use.** This log: verbatim prompts per interaction, the model, tokens per interaction, and the
+  correction instances above.
+
+### Submission status (lines 60 to 69)
+
+- Structured commits: `5a98030`, `397af00`, `e2c6520`, `8ee98ad`, `8884736`, `68fecea`, `8d6ef17`, `5bbf096`,
+  each adding one coherent piece of functionality.
+- Public fork: `origin` is `git@github.com:nelkai16/ds_code_challenge.git`, verified reachable without
+  credentials, so it is public.
+- Outstanding: `5bbf096` is committed but not pushed (`main` is one commit ahead of `origin/main`), and the
+  submission email with the repository link has not been sent. Deadline 2026-09-25.
+- Line 67, watching the original repository for bugfixes, is not started.
+- Sections 2 and 5 (lines 110 and 161) are still to do for this role.
+
+### Section 1 usage
+
+31 interactions, 2026-09-22 15:27 to 2026-09-23 09:45 SAST, all on one model.
+
+- 341,366 input · 172,512 output · 18,435,296 cache-read · 100,828 reasoning tokens · 175 API calls
+- Auxiliary calls (approval, compression): 23,356 in · 18,696 out · 5 calls
+- Model: deepseek-v4-flash (provider: deepseek). No other model was used at any point.
+
 ## Interaction 1 — 2026-09-22 15:27 SAST
 
 ### Prompt
