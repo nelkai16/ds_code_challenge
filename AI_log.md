@@ -812,3 +812,65 @@ total, exit 0.
 - Tokens: 68,019 in · 23,336 out · 1,043,456 cache-read · 9,454 reasoning · 12 API calls
 - Aux calls (approval, compression): 18,505 in · 13,544 out · 2 API calls
 - Basis: delta since baseline (2026-09-23T07:29:45+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 09:41 SAST
+
+## Interaction 32 — 2026-09-23 10:34 SAST
+
+### Prompt
+Let us start then. Please remember the AI_log.md. For this, you have full perms on dir. You can create the scaffolding. Ie, init python file that creates the DB, downloads the files. I want to pick up where I can start querying. Please remember to keep this contained to the dir and that it should work indep of my machine. If you have any questions or concerns, raise instead of assuming an answer.
+
+### Response
+Built the setup stage of 2_Postgres_Join.py and stopped where the querying begins: the container is up, both
+datasets are loaded and indexed, and none of the join itself is written.
+
+- 2_Postgres_Join.py (655 lines): S3 SELECT for the 3,832 resolution 8 hexagons including geometry, a one
+  shot PostGIS container with its data directory on tmpfs, the schema (hexagon, service_request,
+  sr_hex_oracle), both CSVs streamed straight from S3 into their tables with COPY, a GiST indexed point
+  geometry per service request, then a handover that leaves the container running. No staging files, no
+  pandas, no row by row inserts.
+- Container handling is runtime agnostic: docker when it is installed, otherwise podman, overridable with
+  CCT_RUNTIME. Port, password and whether the container survives the run are environment variables too
+  (CCT_PORT, CCT_PASSWORD, CCT_KEEP_CONTAINER), so nothing here is tied to this machine.
+- The readiness check probes TCP rather than the Unix socket, and that is not defensive coding: pg_isready
+  answers during the entrypoint's temporary initdb server, so the first smoke test issued CREATE EXTENSION
+  while the image's own init script was still running, hit a duplicate key error, and the container exited
+  with status 3. Probing over TCP waits for the real server instead of racing the init scripts.
+- Teardown uses rm --force rather than stop. Measured: podman stop spends its full 10 second grace period
+  failing to stop postgres before it SIGKILLs, and the postgis image declares VOLUME
+  /var/lib/postgresql/data, so had the tmpfs been dropped the image's anonymous volume would have outlived
+  the container. removeContainer() reads the mounts and deletes any volume it finds, which is what makes
+  "nothing is left behind" a check rather than a claim.
+- Both inputs were confirmed against the source rather than assumed: 941,635 lines = 941,634 data rows in
+  each after the header, sr.csv.gz's header opening with the empty unnamed pandas index field that the
+  projection drops, and sr_hex.csv.gz carrying h3_level8_index as field 15 of 16, which is what the oracle
+  projection takes. The loader also checks each projected row against its column list, so a short row raises
+  instead of shifting every value one column to the left.
+- Image is 529 MB on disk, not the ~250 MB the plan guessed. All 3,832 r8 geometries are Polygons, so the
+  strict column type holds. 49 rows carry coordinates but no official_suburb: the output cannot assume a
+  suburb is always present.
+
+Measured on the real run (exit 0, 24.5 s total): 2.731 s to fetch the hexagons from a 108,254,980 byte scan,
+2.926 s to bring the container to TCP readiness, 0.111 s for the hexagons, 6.610 s for 941,634 service
+requests, 3.195 s for 941,634 oracle rows, 8.589 s to build 729,270 points, 18.523 s of loading, 24.188 s in
+total. Checked in the database afterwards: 3,832 hexagons, 941,634 service requests, 941,634 oracle rows,
+729,270 with a point and 212,364 without, 0 invalid polygons, service_request 547 MB, both GiST indexes
+present, and a sample point falling inside exactly one cell.
+
+Tests: tests/test_section2.py (8 unit tests, no container) and tests/test_section2_integration.py (6 tests
+against a throwaway container on its own name and port, skipped unless CCT_TEST_CONTAINER=1). Both suites
+green, and the integration fixture leaves no container and no volume behind. requirements.txt gains
+psycopg[binary] and pytest; join.log joins the ignored build products.
+
+Raised rather than assumed: the plan's container teardown and readiness both had to change; the image is
+roughly twice the size the plan stated; the container now survives the run by default because this stage is
+for querying interactively, with a TODO saying that default has to flip once the join and exports land; and
+the published port is fixed at 55432 unless CCT_PORT says otherwise, which will fail if something else
+already holds it.
+
+Deliberately left for the next pass: sr_assigned, the join itself, the failure threshold, the oracle
+validation and the exports. That is the part that has to be mine.
+
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 221,270 in · 168,058 out · 7,867,392 cache-read · 103,019 reasoning · 88 API calls
+- Aux calls (approval, compression): 75,003 in · 43,643 out · 33 API calls
+- Basis: delta since baseline (2026-09-23T07:41:49+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 10:30 SAST
