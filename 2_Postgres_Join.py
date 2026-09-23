@@ -419,6 +419,7 @@ WHERE latitude IS NOT NULL AND longitude IS NOT NULL
 
 ANALYZE = "ANALYZE hexagon; ANALYZE service_request; ANALYZE sr_hex_oracle;"
 
+QUERY = 'SELECT * FROM service_requests;'
 
 # --- loading ---
 
@@ -654,6 +655,12 @@ def main() -> int:
             RUN["counts"] = loadAll(conn, records)
 
         handover(runtime, password)
+        
+        with connect(password).cursor() as cur:
+            cur.execute("select * from service_request;")
+            test = cur.fetchall()
+
+        print(test)
 
     except BaseException as error:
         # The traceback reaches the console on its own; this puts the failure in join.log as well.
@@ -688,6 +695,6 @@ def main() -> int:
     logger.info("counts: %s", RUN["counts"])
     return 0
 
-
+    
 if __name__ == "__main__":
     sys.exit(main())
