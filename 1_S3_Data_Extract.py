@@ -23,6 +23,7 @@ Outputs, all written to the repository root:
 import hashlib
 import json
 import logging
+import os
 import string
 import sys
 import time
@@ -48,6 +49,14 @@ LOG = "validation.log"
 REPORT = "validation_report.json"
 EXTRACT = "r8_hexagons.geojson"
 DETAIL = "validation_results.json"
+
+# The files above are read and written next to the script, not in the working directory, so a run
+# from anywhere finds schema.yml and leaves its outputs in the repository.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def local(name):
+    return os.path.join(BASE_DIR, name)
 
 RESOLUTION_BITS = 52  # H3 packs the resolution into the four highest bits of the 64 bit index
 SHARED_FIELDS = ("index", "centroid_lat", "centroid_lon")  # the fields the extract and the reference share
@@ -150,7 +159,7 @@ def deepValidation(json1, json2):
             * 100,
         }
         newSchema.append(obj)
-    with open(DETAIL, "w", encoding="utf-8") as detail_file:
+    with open(local(DETAIL), "w", encoding="utf-8", newline="\n") as detail_file:
         json.dump(newSchema, detail_file, indent=4)
     return newSchema
 
@@ -366,7 +375,8 @@ def write_extract(records, path):
             for record in sorted(records, key=lambda record: record.get("index", ""))
         ],
     }
-    with open(path, "w", encoding="utf-8") as extract_file:
+    # newline="\n" so the committed extract is byte for byte what a run on Windows writes as well.
+    with open(path, "w", encoding="utf-8", newline="\n") as extract_file:
         json.dump(collection, extract_file, indent=4)
     return path
 
@@ -396,7 +406,7 @@ def writeReport(failure, tally, score, status):
         "bytes": RUN["bytes"],
         "failures": failure,
     }
-    with open(REPORT, "w", encoding="utf-8") as report_file:
+    with open(local(REPORT), "w", encoding="utf-8", newline="\n") as report_file:
         json.dump(report, report_file, indent=4)
     return REPORT
 
@@ -406,9 +416,10 @@ def configure_logging():
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    # %Z so the timestamps carry the machine's timezone, as section 2's do.
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S %Z")
 
-    log_file = logging.FileHandler(LOG, mode="a", encoding="utf-8")
+    log_file = logging.FileHandler(local(LOG), mode="a", encoding="utf-8")
     log_file.setLevel(logging.DEBUG)
     log_file.setFormatter(formatter)
 
@@ -427,7 +438,7 @@ def main():
 
     configure_logging()
     started = time.perf_counter()
-    CONTRACT = load_schema(SCHEMA)
+    CONTRACT = load_schema(local(SCHEMA))
     logger.info("run start: contract %s, threshold %s", SCHEMA, CONTRACT["threshold"])
 
     tick = time.perf_counter()
@@ -468,7 +479,7 @@ def main():
         sys.exit(1)
 
     tick = time.perf_counter()
-    write_extract(queriedJson, EXTRACT)
+    write_extract(queriedJson, local(EXTRACT))
     RUN["timings"]["write_extract"] = round(time.perf_counter() - tick, 3)
     logger.info("wrote %s", EXTRACT)
 

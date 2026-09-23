@@ -17,7 +17,7 @@ dataset:
 
 # Percent. At 3,832 records one record failing every check costs 0.03 of a point, so a threshold
 # near 95 only catches a broadly broken extract.
-threshold: 95
+threshold: 99.5
 
 record_checks:
   - id: required_keys

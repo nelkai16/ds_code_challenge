@@ -1,0 +1,6 @@
+# The data and the outputs are compared byte for byte, and the scripts write them with LF on every
+# OS, so they are checked out with LF on Windows as well, whatever core.autocrlf says.
+*.geojson text eol=lf
+*.json    text eol=lf
+*.yml     text eol=lf
+*.csv     text eol=lf

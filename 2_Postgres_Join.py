@@ -1,26 +1,25 @@
-"""Section 2 - load the H3 resolution 8 hexagons and the service request dataset into a throwaway
-PostgreSQL/PostGIS container, and leave the database up so the join can be written and tried in SQL.
+"""Section 2 - join every service request to the H3 resolution 8 hexagon that contains it, in a
+throwaway PostgreSQL/PostGIS container, validate the join against the provided oracle, and export it.
 
 The container is one shot. It is created when this script starts and removed when it ends, and its
 data directory lives on tmpfs, so no database survives the run and no volume is left behind. Set
 CCT_KEEP_CONTAINER=1 to keep it alive for interactive work instead of removing it.
 
-What this stage does:
+What it does:
   1. S3 SELECT the resolution 8 hexagons (index and geometry) out of city-hex-polygons-8-10.geojson.
   2. Start PostGIS, with the data directory on tmpfs.
   3. Create the schema: hexagon, service_request, sr_hex_oracle.
   4. Stream both CSVs straight from S3 into their tables with COPY. No temporary files, no row by row.
-  5. Build and index a point geometry for every service request, ready to be joined to a hexagon.
-  6. Log the row counts and the psql command, and hand over.
-
-The join, the failure threshold, the oracle validation and the exports are the next stage. This one
-stops as soon as there is something to query.
+  5. Build and index a point geometry for every service request.
+  6. Count the join failures, stop if they are above the threshold, and compare with the oracle.
+  7. Export the join to joined_service_requests.csv and remove the container.
 
 Environment variables:
-  CCT_RUNTIME         container runtime to use (default: docker when installed, otherwise podman)
-  CCT_KEEP_CONTAINER  1 keeps the container when the script exits, 0 removes it (default: keep)
-  CCT_PORT            host port to publish PostgreSQL on (default: 55432)
-  CCT_PASSWORD        password for the postgres user (default: random per run, never logged)
+  CCT_RUNTIME            container runtime to use (default: docker when installed, otherwise podman)
+  CCT_KEEP_CONTAINER     1 keeps the container when the script exits, 0 removes it (default: remove)
+  CCT_PORT               host port to publish PostgreSQL on (default: 55432)
+  CCT_PASSWORD           password for the postgres user (default: the fixed literal below)
+  CCT_FAILURE_THRESHOLD  share of records allowed to fail the join (default: 0.001)
 """
 
 #The join runs in the database because that is where it belongs: one SQL statement against a table of
@@ -39,7 +38,6 @@ import io
 import json
 import logging
 import os
-import secrets
 import shutil
 import signal
 import subprocess
@@ -70,21 +68,34 @@ hexQuery = "SELECT s.properties.index, s.geometry FROM S3Object[*].features[*] s
 
 # --- container ---
 
-image = "docker.io/postgis/postgis:16-3.5-alpine"
+# Pinned by the digest of the tag's index (not of the local amd64 image), so every machine pulls
+# exactly the image the recorded counts came from. postgis/postgis publishes amd64 only, for every
+# tag, so the platform is requested explicitly: an arm64 host (Apple Silicon) then runs it under
+# emulation instead of failing to find a matching manifest. On amd64 the flag changes nothing.
+image = (
+    "docker.io/postgis/postgis:16-3.5-alpine"
+    "@sha256:47e961a569fd52ff31f0fe205ed91eeab17d9f5fff6722e6d7ea6b588748b293"
+)
+platform = "linux/amd64"
 container = "cct-section2-pg"
 dbName = "cct"
 dbUser = "postgres"
+# The database holds public data on a loopback port and is thrown away with the container, so the
+# password is a fixed literal rather than a per-run secret: a reviewer can reproduce a run, connect to
+# it by hand, and read the same command. Override it with CCT_PASSWORD.
+DB_PASSWORD = "Yeb026!"
 hostPort = int(os.environ.get("CCT_PORT", "55432"))
-KEEP_CONTAINER = os.environ.get("CCT_KEEP_CONTAINER", "1") != "0"
+KEEP_CONTAINER = os.environ.get("CCT_KEEP_CONTAINER", "0") != "0"
 DATA_DIR_SIZE = "3g"  # tmpfs holding the whole database; nothing survives the container
-
-# TODO: once the join and the exports are wired into this script, the default has to flip to
-# removing the container, because non-persistence is the requirement. Keeping it alive is a
-# development convenience while the SQL is being written.
 
 # --- outputs ---
 
-LOG = "join.log"
+# Anchored to the script rather than the working directory, so a reviewer who runs this from
+# anywhere still gets the log and the export next to the code.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+LOG = os.path.join(BASE_DIR, "join.log")
+JOINED_CSV = os.path.join(BASE_DIR, "joined_service_requests.csv")  # a build product, so it is ignored in git
 
 logger = logging.getLogger("join")
 
@@ -117,7 +128,9 @@ def startLogging() -> None:
     """Console at INFO, join.log at DEBUG, appended so runs accumulate."""
     logger.setLevel(logging.DEBUG)
 
-    formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+    # %Z so the log carries the machine's timezone: the timings are meaningless to a reviewer on
+    # another machine without it.
+    formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S %Z")
 
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
@@ -159,12 +172,18 @@ def containerRuntime() -> str:
 
 
 def runRuntime(arguments: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    """Run one container runtime command, keeping its output out of the console."""
+    """Run one container runtime command, keeping its output out of the console.
+
+    The output is decoded as UTF-8 whatever the host's locale is: the runtime writes UTF-8, and a
+    cp1252 console on Windows would otherwise fail on the first byte it cannot map.
+    """
     runtime = containerRuntime()
     result = subprocess.run(
         [runtime, *arguments],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if check and result.returncode != 0:
         raise RuntimeError(
@@ -259,6 +278,8 @@ def startContainer(password: str) -> str:
         "run",
         "--detach",
         "--rm",
+        "--platform",
+        platform,
         "--name",
         container,
         "--env",
@@ -301,11 +322,16 @@ def startContainer(password: str) -> str:
         )
         return where
 
-    raise RuntimeError(f"could not start {container}: {lastError}")
+    raise RuntimeError(
+        f"could not start {container}: {lastError}\n"
+        f"If port {hostPort} is already in use, set CCT_PORT to a free one. On an arm64 host the "
+        f"{platform} image needs emulation enabled in the container runtime."
+    )
 
 
 def dsn(password: str) -> str:
-    """Connection string for the published port. The password is quoted, never logged."""
+    """Connection string for the published port. The password is URL-quoted, so the '!' in the
+    default, or any character in CCT_PASSWORD, reaches the server unchanged."""
     return (
         f"postgresql://{dbUser}:{quote(password, safe='')}"
         f"@127.0.0.1:{hostPort}/{dbName}"
@@ -313,8 +339,12 @@ def dsn(password: str) -> str:
 
 
 def connect(password: str) -> psycopg.Connection:
-    """Autocommit, so COPY and DDL are each their own statement and a retry cannot duplicate rows."""
-    return psycopg.connect(dsn(password), autocommit=True)
+    """Autocommit, so COPY and DDL are each their own statement and a retry cannot duplicate rows.
+
+    sslmode is set here because the container has no TLS: a PGSSLMODE=require the reviewer exports
+    for their own databases would otherwise refuse this loopback connection (verified).
+    """
+    return psycopg.connect(dsn(password), autocommit=True, sslmode="disable")
 
 
 # --- input ---
@@ -373,15 +403,19 @@ def selectJson(query: str) -> tuple[list[dict], dict]:
 # --- schema ---
 
 
+# UNLOGGED because the database is thrown away with the container, so crash safety buys nothing,
+# and write-ahead logging the bulk loads nearly doubles the tmpfs the run needs (measured: 1.0 GB
+# of WAL next to 0.7 GB of tables), which is memory a 2 GB Docker Desktop or podman machine VM
+# does not have.
 DDL = """
 CREATE EXTENSION IF NOT EXISTS postgis;
 
-CREATE TABLE hexagon (
+CREATE UNLOGGED TABLE hexagon (
     h3_index text PRIMARY KEY,
     geom geometry(Polygon, 4326) NOT NULL
 );
 
-CREATE TABLE service_request (
+CREATE UNLOGGED TABLE service_request (
     notification_number text PRIMARY KEY,
     reference_number text,
     creation_timestamp timestamptz,
@@ -400,7 +434,7 @@ CREATE TABLE service_request (
     geom geometry(Point, 4326)
 );
 
-CREATE TABLE sr_hex_oracle (
+CREATE UNLOGGED TABLE sr_hex_oracle (
     notification_number text PRIMARY KEY,
     h3_level8_index text NOT NULL
 );
@@ -419,7 +453,59 @@ WHERE latitude IS NOT NULL AND longitude IS NOT NULL
 
 ANALYZE = "ANALYZE hexagon; ANALYZE service_request; ANALYZE sr_hex_oracle;"
 
-QUERY = 'SELECT * FROM service_requests;'
+# The join assigns every request to the hexagon that covers its point. It is a LEFT JOIN so the
+# requests with no coordinates survive it, and the brief wants an index of '0' on those rows rather
+# than a NULL or a dropped row. The ORDER BY is what makes two runs byte-identical: the plan is a
+# parallel scan, and without it the rows come back in whatever order the workers finish (measured:
+# three runs, three different files). COLLATE "C" keeps the order independent of the image's locale.
+JOIN_SERVICE_REQUESTS = """
+SELECT
+    s.notification_number,
+    COALESCE(h.h3_index, '0') AS h3_index
+FROM service_request s
+LEFT JOIN hexagon h ON ST_Covers(h.geom, s.geom)
+ORDER BY s.notification_number COLLATE "C"
+"""
+
+JOIN_TO_CSV = "COPY (" + JOIN_SERVICE_REQUESTS.strip() + ") TO STDOUT WITH (FORMAT csv, HEADER)"
+
+# '0' covers two different situations, so they are counted apart: a request with no coordinates is
+# expected and is what the brief describes, while a request whose point falls outside every hexagon
+# is a join failure, and failures are what the threshold is about.
+COUNT_UNLOCATED_REQUESTS = """
+SELECT count(*)
+FROM service_request s
+WHERE s.latitude IS NULL AND s.longitude IS NULL
+"""
+
+COUNT_FAILED_JOINS = """
+SELECT count(*)
+FROM service_request s
+LEFT JOIN hexagon h ON ST_Covers(h.geom, s.geom)
+WHERE s.geom IS NOT NULL AND h.h3_index IS NULL
+"""
+
+# The oracle is the provided answer for this join, so every row where our index differs from its
+# index is a disagreement -- a wider measurement than the failure count above, because it also
+# catches a record that joined to the wrong hexagon.
+COUNT_ORACLE_DISAGREEMENTS = """
+SELECT count(*)
+FROM service_request s
+LEFT JOIN hexagon h ON ST_Covers(h.geom, s.geom)
+JOIN sr_hex_oracle o ON o.notification_number = s.notification_number
+WHERE COALESCE(h.h3_index, '0') IS DISTINCT FROM o.h3_level8_index
+"""
+
+# Above this share of records failing to join, the run errors out instead of exporting.
+#
+# Motivation, measured on this dataset: 3 of 941,634 records fail to join (0.0003%). All three are
+# points inside the two resolution 8 cells that the provided geojson does not contain, so they are a
+# property of the input rather than a bug in the join, and a threshold below them would fail every
+# correct run. 0.1% sits about 300x above that floor: quiet on healthy data, but still catching the
+# failures that matter -- a hexagon set that came back empty or doubled, a coordinate column read out
+# of position, or a predicate that has stopped matching. Each of those moves the count into the
+# thousands, not the tens.
+JOIN_FAILURE_THRESHOLD = float(os.environ.get("CCT_FAILURE_THRESHOLD", "0.001"))
 
 # --- loading ---
 
@@ -591,26 +677,68 @@ def loadAll(conn: psycopg.Connection, records: list[dict]) -> dict[str, Any]:
     return counts
 
 
-# --- entry point ---
+def joinCount(conn: psycopg.Connection) -> list[tuple[Any, ...]]:
+    """Count the requests with no coordinates: the rows the join can only answer with '0'."""
+    with conn.cursor() as cur:
+        cur.execute(COUNT_UNLOCATED_REQUESTS)
+        return cur.fetchall()
+
+
+def joinFailures(conn: psycopg.Connection) -> list[tuple[Any, ...]]:
+    """Count the requests that have coordinates but found no hexagon: the join failures.
+
+    These are the rows a failure threshold is about. The 212,364 without coordinates are not
+    failures, they are the rows the brief asks to be marked '0'.
+    """
+    with conn.cursor() as cur:
+        cur.execute(COUNT_FAILED_JOINS)
+        return cur.fetchall()
+
+
+def exportJoin(conn: psycopg.Connection, path: str) -> int:
+    """Write the joined rows to `path` as CSV, straight out of the database.
+
+    COPY streams them, so a million rows never sit in Python memory. The return value is the file's
+    size, which is enough for the log to tell an empty export from a real one.
+    """
+    with conn.cursor() as cur, open(path, "wb") as handle:
+        with cur.copy(JOIN_TO_CSV) as copy:
+            for block in copy:
+                handle.write(bytes(block))
+    return os.path.getsize(path)
+
+
+def oracleDisagreements(conn: psycopg.Connection) -> list[tuple[Any, ...]]:
+    """Count the rows where the join's index differs from the oracle's.
+
+    Wider than the failure count: it also sees a record that joined to the wrong hexagon.
+    """
+    with conn.cursor() as cur:
+        cur.execute(COUNT_ORACLE_DISAGREEMENTS)
+        return cur.fetchall()
+
+
+def checkJoinThreshold(failures: int, total: int) -> float:
+    """Error out when too many records failed to join; return the failure rate either way."""
+    rate = failures / total if total else 0.0
+    if rate > JOIN_FAILURE_THRESHOLD:
+        raise ValueError(
+            f"join failure rate {rate:.5%} is above the {JOIN_FAILURE_THRESHOLD:.3%} threshold: "
+            f"{failures} of {total} records found no hexagon"
+        )
+    return rate
 
 
 def handover(runtime: str, password: str) -> None:
-    """Tell the executor how to get at the database."""
-    logger.info(
-        "loaded %s rows into hexagon, %s into service_request, %s into sr_hex_oracle",
-        RUN["counts"].get("hexagons"),
-        RUN["counts"].get("service_requests"),
-        RUN["counts"].get("oracle_rows"),
-    )
+    """Tell the executor how to get at the database, when CCT_KEEP_CONTAINER has kept it."""
     logger.info("query it with: %s exec -it %s psql -U %s -d %s", runtime, container, dbUser, dbName)
-    if os.environ.get("CCT_PASSWORD"):
-        logger.info(
-            "or from the host: PGPASSWORD=<CCT_PASSWORD> psql -h 127.0.0.1 -p %d -U %s -d %s",
-            hostPort,
-            dbUser,
-            dbName,
-        )
-    logger.info("remove it with: %s rm --force %s", runtime, container)
+    logger.info(
+        "or from the host: PGPASSWORD=%s psql -h 127.0.0.1 -p %d -U %s -d %s",
+        password,
+        hostPort,
+        dbUser,
+        dbName,
+    )
 
 
 def main() -> int:
@@ -622,7 +750,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
 
     runtime = containerRuntime()
-    password = os.environ.get("CCT_PASSWORD") or secrets.token_urlsafe(24)  # generated, never logged
+    # `or`, not a get() default: an empty CCT_PASSWORD would start a server the image refuses to init.
+    password = os.environ.get("CCT_PASSWORD") or DB_PASSWORD
     RUN["container"] = {
         "runtime": runtime,
         "image": image,
@@ -631,6 +760,7 @@ def main() -> int:
         "one_shot": not KEEP_CONTAINER,
     }
 
+    connected = False
     try:
         t0 = time.monotonic()
         records, stats = selectJson(hexQuery)
@@ -652,20 +782,54 @@ def main() -> int:
         RUN["timings"]["container_start"] = round(time.monotonic() - t0, 3)
 
         with connect(password) as conn:
+            connected = True
             RUN["counts"] = loadAll(conn, records)
 
-        handover(runtime, password)
-        
-        with connect(password).cursor() as cur:
-            cur.execute("select * from service_request;")
-            test = cur.fetchall()
+            total = RUN["counts"]["service_requests"]
+            failures = joinFailures(conn)[0][0]
+            disagreements = oracleDisagreements(conn)[0][0]
+            RUN["counts"]["failed_joins"] = failures
+            RUN["counts"]["oracle_disagreements"] = disagreements
 
-        print(test)
+            # Raises before anything is exported if the failures are above the threshold.
+            rate = checkJoinThreshold(failures, total)
+            logger.info(
+                "join: %s records, %s with no coordinates marked '0', %s failed to join (%.5f%%)",
+                total,
+                joinCount(conn)[0][0],
+                failures,
+                100 * rate,
+            )
+            logger.info(
+                "oracle validation: %s of %s rows disagree (%.5f%% of the dataset)",
+                disagreements,
+                total,
+                100 * disagreements / total if total else 0.0,
+            )
+
+            t0 = time.monotonic()
+            RUN["bytes"]["joined_csv"] = exportJoin(conn, JOINED_CSV)
+            RUN["timings"]["export_join"] = round(time.monotonic() - t0, 3)
+            logger.info("wrote %s B of joined rows to %s", RUN["bytes"]["joined_csv"], JOINED_CSV)
+
+        if KEEP_CONTAINER:
+            handover(runtime, password)
 
     except BaseException as error:
         # The traceback reaches the console on its own; this puts the failure in join.log as well.
         logger.error("run failed: %r", error)
         logger.debug("traceback", exc_info=True)
+        # A connection that drops mid run almost always means the kernel killed a postgres process
+        # for memory, and nothing else says so, so name it rather than leave only "server closed the
+        # connection". Measured: the run peaks at 1.1 GB in the container, fails at a 1 GB limit and
+        # completes at 1.25 GB.
+        # A failure to connect in the first place is left to its own libpq message.
+        if connected and isinstance(error, psycopg.OperationalError):
+            logger.error(
+                "the database connection was lost. The usual cause is the container running out of "
+                "memory: the run needs about 1.5 GB free in the container runtime (the Docker "
+                "Desktop, podman machine or colima VM on macOS and Windows)."
+            )
         raise
 
     finally:
@@ -695,6 +859,6 @@ def main() -> int:
     logger.info("counts: %s", RUN["counts"])
     return 0
 
-    
+
 if __name__ == "__main__":
     sys.exit(main())

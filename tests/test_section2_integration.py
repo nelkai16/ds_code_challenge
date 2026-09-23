@@ -3,7 +3,7 @@
 They start their own throwaway container, on a different name and port from the script's, so they can
 run alongside a kept-alive development container without touching it.
 
-Run with: CCT_TEST_CONTAINER=1 .venv/bin/pytest -q tests/test_section2_integration.py
+Run with: CCT_TEST_CONTAINER=1 python -m pytest -q tests/test_section2_integration.py
 Without CCT_TEST_CONTAINER=1 they skip, so the default test run stays fast and offline.
 
 The tests that matter and cannot be unit tested: that the image really gives us PostGIS, that the
@@ -15,20 +15,21 @@ value one column to the left.
 import gzip
 import io
 import os
-import shutil
 
 import pytest
 
 TEST_CONTAINER = "cct-section2-test"
 TEST_PORT = 55433
-TEST_PASSWORD = "section2-test-password"
+TEST_PASSWORD = "Yeb026!"  # public data, loopback port: a fixed literal keeps runs reproducible
 
 
 @pytest.fixture(scope="module")
 def database(join):
     if os.environ.get("CCT_TEST_CONTAINER") != "1":
         pytest.skip("set CCT_TEST_CONTAINER=1 to run the tests that start a container")
-    if not (shutil.which("docker") or shutil.which("podman")):
+    try:
+        join.containerRuntime()
+    except RuntimeError:
         pytest.skip("no container runtime on PATH")
 
     # Every container function reads these two module globals, so pointing them at the test container
