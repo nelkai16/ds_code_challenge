@@ -41,6 +41,7 @@ import logging
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -50,6 +51,7 @@ from urllib.parse import quote
 import boto3
 import psycopg
 import requests
+import urllib3  # already installed with requests and boto3; named here for its stream exceptions
 from psycopg import sql
 
 # --- dataset (the public challenge bucket; the credentials object holds no privileges) ---
@@ -171,13 +173,15 @@ def runRuntime(arguments: list[str], check: bool = True) -> subprocess.Completed
     return result
 
 
-def removeContainer() -> None:
+def removeContainer() -> bool:
     """Remove the container, and any volume the image attached to its data directory.
 
     The postgis image declares VOLUME /var/lib/postgresql/data. On tmpfs that declaration is
     overridden and nothing is left behind, but if the fallback (no tmpfs) is ever used, the anonymous
     volume would outlive the container and break the non-persistence guarantee, so it is removed
     explicitly rather than assumed away.
+
+    Returns whether the container is gone afterwards, so "removed" is logged as a check, not a claim.
     """
     mounts = runRuntime(
         ["inspect", container, "--format", "{{range .Mounts}}{{.Type}}:{{.Name}}\n{{end}}"],
@@ -194,6 +198,9 @@ def removeContainer() -> None:
     for volume in volumes:
         logger.debug("removing volume %s left by %s", volume, container)
         runRuntime(["volume", "rm", "--force", volume], check=False)
+
+    # rm is unchecked because the container may never have existed; whether it is gone is checked here.
+    return runRuntime(["inspect", "--type", "container", container], check=False).returncode != 0
 
 
 def waitUntilReady(timeout: float = 180.0) -> None:
@@ -243,8 +250,8 @@ def startContainer(password: str) -> str:
     """Start the container and return a description of where its data directory lives.
 
     tmpfs first, so the database cannot outlive the container. If the host refuses that (rootless
-    podman without the right delegation, for instance), fall back to the image's own writable layer:
-    still ephemeral, still removed with the container, just not in RAM.
+    podman without the right delegation, for instance), fall back to the anonymous volume the image
+    declares for its data directory: on disk rather than in RAM, and removed by removeContainer().
     """
     removeContainer()
 
@@ -266,7 +273,7 @@ def startContainer(password: str) -> str:
 
     attempts = (
         ("tmpfs", ["--tmpfs", f"/var/lib/postgresql/data:rw,size={DATA_DIR_SIZE}"]),
-        ("container writable layer", []),
+        ("anonymous volume", []),
     )
 
     lastError = ""
@@ -346,11 +353,18 @@ def selectJson(query: str) -> tuple[list[dict], dict]:
 
     payload = bytearray()
     stats: dict = {}
+    ended = False
     for event in response["Payload"]:
         if "Records" in event:
             payload += event["Records"]["Payload"]
         elif "Stats" in event:
             stats = event["Stats"]["Details"]
+        elif "End" in event:
+            ended = True
+
+    # A stream cut at a record boundary parses cleanly, so only the End event proves nothing is missing.
+    if not ended:
+        raise RuntimeError(f"S3 SELECT on {resFile} ended without an End event: the result is incomplete")
 
     lines = [line for line in payload.decode("utf-8").split("\n") if line.strip()]
     return [json.loads(line) for line in lines], stats
@@ -491,7 +505,9 @@ def loadCsv(
             with requests.get(sourceUrl, stream=True, timeout=600) as response:
                 response.raise_for_status()
                 return loadCsvStream(conn, response.raw, table, columns, projector)
-        except (requests.RequestException, OSError, EOFError) as error:
+        # Reading response.raw raises urllib3's own errors (a dropped connection is a ProtocolError),
+        # which are neither requests nor OS errors, so without them the retry never fires mid stream.
+        except (requests.RequestException, urllib3.exceptions.HTTPError, OSError, EOFError) as error:
             if attempt == 2:
                 raise
             logger.warning("%s: %s; retrying once", sourceUrl, error)
@@ -600,6 +616,10 @@ def main() -> int:
     startLogging()
     started = time.monotonic()
 
+    # By default SIGTERM ends Python without running finally, which would leave the container behind.
+    # Turned into SystemExit, it goes through the same teardown as an error or Ctrl-C.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
     runtime = containerRuntime()
     password = os.environ.get("CCT_PASSWORD") or secrets.token_urlsafe(24)  # generated, never logged
     RUN["container"] = {
@@ -607,7 +627,7 @@ def main() -> int:
         "image": image,
         "name": container,
         "host_port": hostPort,
-        "one_shot": True,
+        "one_shot": not KEEP_CONTAINER,
     }
 
     try:
@@ -635,6 +655,12 @@ def main() -> int:
 
         handover(runtime, password)
 
+    except BaseException as error:
+        # The traceback reaches the console on its own; this puts the failure in join.log as well.
+        logger.error("run failed: %r", error)
+        logger.debug("traceback", exc_info=True)
+        raise
+
     finally:
         if KEEP_CONTAINER:
             logger.info(
@@ -645,9 +671,17 @@ def main() -> int:
             )
         else:
             t0 = time.monotonic()
-            removeContainer()
+            removed = removeContainer()
             RUN["timings"]["container_remove"] = round(time.monotonic() - t0, 3)
-            logger.info("container %s removed", container)
+            if removed:
+                logger.info("container %s removed", container)
+            else:
+                logger.error(
+                    "container %s is still there. Remove it with: %s rm --force %s",
+                    container,
+                    runtime,
+                    container,
+                )
 
     RUN["timings"]["total"] = round(time.monotonic() - started, 3)
     logger.info("timings in seconds: %s", RUN["timings"])

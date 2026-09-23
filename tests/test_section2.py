@@ -3,6 +3,8 @@
 Run with: .venv/bin/pytest -q tests/test_section2.py
 """
 
+import pytest
+
 
 def test_service_request_projection_drops_the_pandas_index_column(join):
     row = ["7"] + [f"value{position}" for position in range(1, 16)]
@@ -47,9 +49,18 @@ def test_container_runtime_honours_the_override(join, monkeypatch):
     assert join.containerRuntime() == "podman"
 
 
-def test_container_runtime_finds_something_on_this_machine(join):
-    # docker or podman, whichever is installed; the point is that it does not raise here.
-    assert join.containerRuntime() in ("docker", "podman")
+def test_container_runtime_prefers_docker_then_podman_then_refuses(join, monkeypatch):
+    # Decided by a faked PATH, so the result does not depend on what the test machine has installed.
+    monkeypatch.delenv("CCT_RUNTIME", raising=False)
+    installed = {"docker", "podman"}
+    monkeypatch.setattr(join.shutil, "which", lambda name: f"/usr/bin/{name}" if name in installed else None)
+
+    assert join.containerRuntime() == "docker"
+    installed.discard("docker")
+    assert join.containerRuntime() == "podman"
+    installed.discard("podman")
+    with pytest.raises(RuntimeError, match="neither docker nor podman"):
+        join.containerRuntime()
 
 
 def test_the_hexagon_query_asks_for_the_geometry_the_join_needs(join):

@@ -874,3 +874,55 @@ validation and the exports. That is the part that has to be mine.
 - Tokens: 221,270 in · 168,058 out · 7,867,392 cache-read · 103,019 reasoning · 88 API calls
 - Aux calls (approval, compression): 75,003 in · 43,643 out · 33 API calls
 - Basis: delta since baseline (2026-09-23T07:41:49+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 10:30 SAST
+
+## Interaction 33 — 2026-09-23 16:25 SAST
+
+### Prompt
+Spin up an instance of Claude Code using Opus 5.5, high effort and thinking to evaluate the work we have done up to this point. I am more concerned regarding the scaffolding for section 2. If it wants to make edits there, it is allowed to.
+
+(Followed by "Approved", for the CLI update it turned out to need.)
+
+### Response
+A second model was used as an independent reviewer of the section 2 setup stage only: Claude Code on
+claude-opus-5-5, high effort, extended thinking, given a written brief instead of a conversation, and
+restricted to editing 2_Postgres_Join.py and the section 2 tests, with no git writes and a spend cap.
+The installed CLI was 2.1.278 and had to be updated to 2.1.280 before it would accept that model. The
+brief and its full report are kept outside the repo.
+
+It made eleven edits. None of them were taken on trust: the pipeline was re-run afterwards (exit 0,
+identical counts, 25.8 s), the unit and integration suites were re-run, a run was killed with SIGTERM
+mid-load, a CCT_KEEP_CONTAINER=0 run was watched to completion, and this machine directly probed the
+S3 event stream to prove the new completeness guard cannot misfire.
+
+What it found that matters, and what was done about it:
+
+- The loader skips the CSV header without checking it, and projectOracleRow returns exactly two fields
+  by position, so the width guard can never fire for the oracle. A reordered or re-exported
+  sr_hex.csv.gz would therefore load silently and every later number would be measured against a wrong
+  oracle. Not fixed: it needs the real header names to check against, and that change belongs with the
+  oracle validation step.
+- The download retry never caught the case it was written for: the CSVs are read through response.raw,
+  which raises urllib3 errors, and urllib3's HTTPError is neither OSError nor requests.RequestException.
+  Fixed.
+- Building the point geometry with an UPDATE after COPY writes all 729,270 rows a second time because
+  geom is indexed; it is 8.6 s of the 18.5 s load. A generated column would remove the UPDATE entirely.
+  Flagged, not changed, since it alters the schema this stage hands over.
+- Nothing measures whether service_request_geom_idx is the index the join will actually use; the planner
+  can drive the comparison from either side.
+- The 3 GB tmpfs and the container's default 64 MB /dev/shm are both unmeasured, and a parallel
+  comparison of the oracle against the join can fail on shared memory.
+- A SIGTERM used to skip teardown and leave the container running. Fixed, and proved by killing a run
+  14 s into the load: exit 143, container removed, no container and no volume left behind.
+- The integration tests share state and are order dependent: running the point-geometry test alone
+  fails with a TypeError. Confirmed.
+
+Cost: the CLI reported $1.948 for the turn that produced the report. The first invocation was killed by
+a client timeout after 420 s and reported nothing, so its cost is unknown; the transcript for the whole
+session records 66 turns, 4,217,622 cache-read, 215,063 cache-creation, 119,562 output and 130 input
+tokens.
+
+### Usage
+- Model: deepseek-v4-flash (provider: deepseek)
+- Tokens: 73,370 in · 45,247 out · 2,984,832 cache-read · 30,816 reasoning · 36 API calls
+- Aux calls (approval, compression): 26,794 in · 15,437 out · 8 API calls
+- Basis: delta since baseline (2026-09-23T08:30:20+00:00) · session `20260922_150548_a4cd59` · captured 2026-09-23 16:21 SAST
